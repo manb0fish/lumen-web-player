@@ -1,0 +1,17 @@
+# dependencies and build output
+node_modules/
+dist/
+
+# test output
+test-results/
+playwright-report/
+
+# sample media is synthesised locally by `npm run media`
+public/media/
+
+# local tooling and scratch files
+.claude/
+prompt.txt
+*.log
+.DS_Store
+Thumbs.db

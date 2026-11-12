@@ -1,0 +1,4 @@
+# Keep line endings consistent across platforms (the test media scripts and shaders are LF).
+* text=auto eol=lf
+*.png binary
+*.woff2 binary

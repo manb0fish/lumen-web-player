@@ -1,0 +1,28 @@
+/* Structural styles for the video stage. Skins never need to touch these. */
+.lp-stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: #000;
+  contain: strict;
+}
+.lp-stage > .lp-video-canvas,
+.lp-stage > .lp-sub-canvas {
+  position: absolute;
+  display: block;
+  left: 0;
+  top: 0;
+}
+.lp-stage > .lp-sub-canvas {
+  pointer-events: none;
+}
+/* MSE / native element: normally hidden underneath the GPU canvas, which re-renders its frames. */
+.lp-stage > .lp-native-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  pointer-events: none;
+}

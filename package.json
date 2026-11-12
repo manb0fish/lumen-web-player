@@ -1,0 +1,69 @@
+{
+  "name": "lumen-web-player",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Lumen Player: an mpv-class media player for the web. WebCodecs / MSE / FFmpeg-WASM decoding, WebGPU / WebGL2 / Canvas 2D rendering, an AudioWorklet master clock, libass subtitles and a skinnable UI.",
+  "keywords": [
+    "media-player",
+    "video-player",
+    "webcodecs",
+    "webgpu",
+    "mse",
+    "ffmpeg-wasm",
+    "audioworklet",
+    "libass",
+    "subtitles",
+    "mpv"
+  ],
+  "license": "GPL-3.0-only",
+  "author": "manb0fish (https://github.com/manb0fish)",
+  "contributors": [
+    "Claude (Anthropic) <noreply@anthropic.com> (https://claude.com/claude-code)"
+  ],
+  "homepage": "https://github.com/manb0fish/lumen-web-player#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manb0fish/lumen-web-player.git"
+  },
+  "bugs": {
+    "url": "https://github.com/manb0fish/lumen-web-player/issues"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "media": "node scripts/gen-media.mjs",
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "lint": "tsc --noEmit && prettier --check .",
+    "test": "playwright test",
+    "test:unit": "playwright test tests/unit",
+    "test:preview": "node scripts/test-preview.mjs",
+    "test:headed": "node scripts/test-preview.mjs --dev --headed",
+    "probe": "node scripts/probe.mjs"
+  },
+  "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@ffmpeg/core-mt": "^0.12.10",
+    "jassub": "^2.5.37",
+    "mediabunny": "^1.65.2"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0",
+    "@types/node": "^26.6.6",
+    "@webgpu/types": "^0.1.74",
+    "dejavu-fonts-ttf": "^2.37.3",
+    "ffmpeg-static": "^5.3.0",
+    "pngjs": "^7.0.0",
+    "prettier": "^3.10.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.7"
+  },
+  "allowScripts": {
+    "ffmpeg-static@5.3.0": true
+  }
+}

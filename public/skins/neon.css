@@ -1,0 +1,40 @@
+/*
+ * Stylesheet of an external skin package. Rules are written without any prefix: the skin engine
+ * scopes them to this skin automatically, and hoists @keyframes to the top level.
+ */
+@keyframes lp-neon-pulse {
+  from {
+    box-shadow: 0 0 6px var(--lp-accent);
+  }
+  to {
+    box-shadow: 0 0 16px var(--lp-accent);
+  }
+}
+.lp-region-bottom {
+  padding: 8px 10px;
+  background: var(--lp-bg);
+  border-top: 1px solid var(--lp-border);
+}
+.lp-region-top {
+  padding: 10px 12px;
+}
+.lp-btn {
+  border: 1px solid var(--lp-border);
+  color: var(--lp-accent);
+}
+.lp-btn:hover {
+  background: rgba(57, 255, 20, 0.16);
+}
+.lp-btn-play {
+  animation: lp-neon-pulse 0.9s ease-in-out infinite alternate;
+}
+.lp-seek-track {
+  border-radius: 0;
+  border: 1px solid var(--lp-border);
+}
+.lp-time,
+.lp-title,
+.lp-osd-box {
+  font-family: var(--lp-font-mono);
+  text-shadow: 0 0 8px var(--lp-accent);
+}

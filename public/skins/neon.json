@@ -1,0 +1,48 @@
+{
+  "id": "neon",
+  "name": "Neon Arcade (example package)",
+  "version": "1.0.0",
+  "author": "Lumen examples",
+  "description": "An external skin: loaded at runtime from /skins/neon.json",
+  "tokens": {
+    "--lp-accent": "#39ff14",
+    "--lp-accent-contrast": "#001a00",
+    "--lp-fg": "#eaffea",
+    "--lp-fg-dim": "rgba(234, 255, 234, 0.6)",
+    "--lp-bg": "rgba(4, 12, 6, 0.82)",
+    "--lp-bg-solid": "#050d07",
+    "--lp-border": "rgba(57, 255, 20, 0.35)",
+    "--lp-radius": "2px",
+    "--lp-radius-sm": "2px",
+    "--lp-seek-height": "6px",
+    "--lp-seek-hover-height": "8px",
+    "--lp-seek-played": "#39ff14",
+    "--lp-osd-color": "#39ff14",
+    "--lp-osd-size": "20px"
+  },
+  "layout": {
+    "top": [["tier-badge", "spacer", "title"]],
+    "bottom": [
+      [
+        { "control": "button", "command": "seek -10", "icon": "rewind", "title": "Back 10 s" },
+        "play",
+        { "control": "button", "command": "seek 10", "icon": "forward", "title": "Forward 10 s" },
+        "seekbar",
+        { "control": "time", "format": "{current} · {remaining}" },
+        { "control": "button", "command": "cycle-values speed 1 1.5 2", "label": "TURBO", "title": "Cycle speed" },
+        "subtitles",
+        "video",
+        "skins",
+        "fullscreen"
+      ]
+    ]
+  },
+  "icons": {
+    "play": "<path d=\"M6 3h3v3h3v3h3v3h3v0h-3v3h-3v3H9v3H6z\"/>",
+    "pause": "<path d=\"M5 4h5v16H5zM14 4h5v16h-5z\"/>"
+  },
+  "stylesheet": "neon.css",
+  "osd": { "position": "center" },
+  "autohide": 1800,
+  "seekbar": { "thumbnails": true }
+}

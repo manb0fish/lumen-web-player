@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Lumen Player</title>
+    <link rel="icon" href="/favicon.svg" />
+    <style>
+      :root {
+        color-scheme: dark;
+        --app-bg: #0c0e11;
+        --app-panel: #13161a;
+        --app-border: rgba(255, 255, 255, 0.08);
+        --app-fg: #e7eaee;
+        --app-dim: rgba(231, 234, 238, 0.56);
+        --app-accent: #7dd3fc;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: var(--app-bg);
+        color: var(--app-fg);
+        font: 13px/1.4 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+      #app {
+        display: grid;
+        grid-template-columns: 272px minmax(0, 1fr);
+        height: 100%;
+      }
+      #app[data-sidebar='off'] {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      #app[data-sidebar='off'] aside {
+        display: none;
+      }
+      aside {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        border-right: 1px solid var(--app-border);
+        background: var(--app-panel);
+      }
+      aside header {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        padding: 14px 16px 12px;
+        border-bottom: 1px solid var(--app-border);
+      }
+      aside header svg {
+        width: 22px;
+        height: 22px;
+        flex: none;
+      }
+      aside header b {
+        font-size: 15px;
+        letter-spacing: 0.01em;
+      }
+      aside header span {
+        margin-left: auto;
+        color: var(--app-dim);
+        font: 11px ui-monospace, Consolas, monospace;
+      }
+      #samples {
+        flex: 1;
+        overflow: auto;
+        padding: 6px 8px 14px;
+        scrollbar-width: thin;
+      }
+      #samples h3 {
+        margin: 14px 8px 5px;
+        font: 600 10px/1.4 ui-monospace, Consolas, monospace;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: var(--app-dim);
+      }
+      #samples button {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        width: 100%;
+        padding: 6px 8px;
+        border: 0;
+        border-radius: 6px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      #samples button:hover {
+        background: rgba(255, 255, 255, 0.07);
+      }
+      #samples button[data-active='true'] {
+        background: rgba(125, 211, 252, 0.12);
+        color: var(--app-accent);
+      }
+      #samples button span {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #samples button small {
+        flex: none;
+        color: var(--app-dim);
+        font: 10.5px ui-monospace, Consolas, monospace;
+      }
+      #samples p {
+        margin: 10px 8px;
+        color: var(--app-dim);
+      }
+      #samples code {
+        font: 11.5px ui-monospace, Consolas, monospace;
+        color: var(--app-fg);
+      }
+      main {
+        position: relative;
+        min-width: 0;
+        min-height: 0;
+      }
+      #player {
+        position: absolute;
+        inset: 0;
+      }
+      @media (max-width: 760px) {
+        #app {
+          grid-template-columns: minmax(0, 1fr);
+        }
+        aside {
+          display: none;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <aside>
+        <header>
+          <svg viewBox="0 0 32 32" aria-hidden="true">
+            <rect width="32" height="32" rx="7" fill="#101418" />
+            <path d="M12 9.5v13l11-6.5z" fill="#7dd3fc" />
+          </svg>
+          <b>Lumen</b>
+          <span id="caps"></span>
+        </header>
+        <nav id="samples" aria-label="Sample media"></nav>
+      </aside>
+      <main>
+        <div id="player"></div>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

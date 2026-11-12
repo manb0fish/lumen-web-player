@@ -1,0 +1,54 @@
+{
+  "id": "glass",
+  "name": "Modern Glass",
+  "version": "1.0.0",
+  "author": "Lumen",
+  "description": "Minimal floating bar on frosted glass",
+  "tokens": {
+    "--lp-accent": "#7dd3fc",
+    "--lp-accent-contrast": "#06141c",
+    "--lp-fg": "#f4f6f8",
+    "--lp-fg-dim": "rgba(244, 246, 248, 0.62)",
+    "--lp-bg": "rgba(20, 22, 28, 0.52)",
+    "--lp-bg-solid": "#171a20",
+    "--lp-border": "rgba(255, 255, 255, 0.12)",
+    "--lp-radius": "16px",
+    "--lp-radius-sm": "9px",
+    "--lp-blur": "22px",
+    "--lp-button-size": "36px",
+    "--lp-icon-size": "20px",
+    "--lp-seek-height": "4px",
+    "--lp-seek-hover-height": "6px",
+    "--lp-seek-played": "#7dd3fc",
+    "--lp-thumb-color": "#ffffff",
+    "--lp-osd-size": "18px",
+    "--lp-osd-color": "#ffffff",
+    "--lp-osd-bg": "rgba(20, 22, 28, 0.6)"
+  },
+  "layout": {
+    "top": [["title", "tier-badge", "spacer", "open", "skins"]],
+    "center": [["big-play"]],
+    "bottom": [
+      ["seekbar"],
+      [
+        "play",
+        { "control": "prev-frame", "hideNarrow": true },
+        { "control": "next-frame", "hideNarrow": true },
+        "mute",
+        { "control": "volume", "hideNarrow": true },
+        "time",
+        "spacer",
+        { "control": "speed", "hideNarrow": true },
+        "subtitles",
+        "audio",
+        "video",
+        { "control": "tier", "hideNarrow": true },
+        { "control": "stats", "hideNarrow": true },
+        "fullscreen"
+      ]
+    ]
+  },
+  "osd": { "position": "top-right" },
+  "autohide": 2600,
+  "seekbar": { "thumbnails": true }
+}

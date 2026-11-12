@@ -1,0 +1,80 @@
+{
+  "id": "studio",
+  "name": "Studio Deck",
+  "version": "1.0.0",
+  "author": "Lumen",
+  "description": "Docked transport deck with LCD timecode and meters",
+  "tokens": {
+    "--lp-accent": "#ffb000",
+    "--lp-accent-contrast": "#1a1200",
+    "--lp-fg": "#e9e4d8",
+    "--lp-fg-dim": "rgba(233, 228, 216, 0.58)",
+    "--lp-bg": "#24272c",
+    "--lp-bg-solid": "#202327",
+    "--lp-border": "rgba(255, 255, 255, 0.11)",
+    "--lp-radius": "6px",
+    "--lp-radius-sm": "4px",
+    "--lp-button-size": "40px",
+    "--lp-icon-size": "20px",
+    "--lp-gap": "6px",
+    "--lp-seek-height": "12px",
+    "--lp-seek-hover-height": "12px",
+    "--lp-seek-track": "#0e1012",
+    "--lp-seek-buffer": "rgba(255, 176, 0, 0.2)",
+    "--lp-seek-played": "#ffb000",
+    "--lp-thumb-size": "18px",
+    "--lp-thumb-color": "#d9dde2",
+    "--lp-osd-size": "18px",
+    "--lp-osd-color": "#ffb000",
+    "--lp-osd-bg": "rgba(10, 12, 9, 0.88)",
+    "--lp-lcd-color": "#ffb000",
+    "--lp-lcd-bg": "#0b0d09",
+    "--lp-vu-color": "#4ade80",
+    "--lp-vu-peak": "#ffb000"
+  },
+  "layout": {
+    "bottom": [
+      [
+        { "control": "group", "class": "lp-deck-transport", "items": ["stop", "prev-frame", "play", "next-frame", "loop", "abloop"] },
+        "lcd",
+        { "control": "group", "class": "lp-deck-meter", "items": [{ "control": "vu", "bars": 22 }] },
+        "spacer",
+        {
+          "control": "group",
+          "class": "lp-deck-toggles lp-hide-narrow",
+          "items": [
+            "sub-toggle",
+            "deband",
+            "normalize",
+            {
+              "control": "button",
+              "command": "cycle-values sharpen 0 0.5 1",
+              "label": "SHARP",
+              "title": "Sharpen (RCAS)",
+              "active": "sharpen"
+            }
+          ]
+        },
+        { "control": "group", "class": "lp-deck-level", "items": ["mute", "volume"] }
+      ],
+      [
+        { "control": "time", "format": "{current}" },
+        "seekbar",
+        { "control": "time", "format": "{remaining}" },
+        { "control": "speed", "hideNarrow": true },
+        "subtitles",
+        "audio",
+        "video",
+        { "control": "tier", "hideNarrow": true },
+        { "control": "stats", "hideNarrow": true },
+        "skins",
+        "open",
+        "fullscreen"
+      ]
+    ]
+  },
+  "osd": { "position": "top-center" },
+  "autohide": 0,
+  "dock": true,
+  "seekbar": { "thumbnails": true }
+}

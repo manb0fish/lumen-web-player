@@ -1,0 +1,8 @@
+node_modules
+dist
+test-results
+playwright-report
+public/media
+package-lock.json
+# prose and translations are hand-formatted
+*.md

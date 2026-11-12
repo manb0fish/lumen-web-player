@@ -1,0 +1,57 @@
+{
+  "id": "mpv",
+  "name": "mpv OSC",
+  "version": "1.0.0",
+  "author": "Lumen",
+  "description": "Terminal-flavoured bar, status line and OSD text",
+  "tokens": {
+    "--lp-accent": "#ffd75f",
+    "--lp-accent-contrast": "#000000",
+    "--lp-fg": "#e8e8e8",
+    "--lp-fg-dim": "rgba(232, 232, 232, 0.6)",
+    "--lp-bg": "rgba(0, 0, 0, 0.78)",
+    "--lp-bg-solid": "#0b0b0b",
+    "--lp-border": "rgba(255, 255, 255, 0.22)",
+    "--lp-radius": "0px",
+    "--lp-radius-sm": "0px",
+    "--lp-button-size": "28px",
+    "--lp-icon-size": "16px",
+    "--lp-gap": "2px",
+    "--lp-seek-height": "10px",
+    "--lp-seek-hover-height": "10px",
+    "--lp-seek-track": "rgba(255, 255, 255, 0.08)",
+    "--lp-seek-buffer": "rgba(255, 255, 255, 0.2)",
+    "--lp-seek-played": "#e8e8e8",
+    "--lp-thumb-size": "0px",
+    "--lp-osd-size": "26px",
+    "--lp-osd-color": "#ffff66",
+    "--lp-osd-bg": "transparent",
+    "--lp-anim": "60ms"
+  },
+  "layout": {
+    "top": [["status-line"]],
+    "bottom": [
+      [
+        "play",
+        { "control": "prev-frame", "hideNarrow": true },
+        { "control": "next-frame", "hideNarrow": true },
+        { "control": "time", "format": "{current} / {duration} ({percent}%)" },
+        "seekbar",
+        { "control": "speed", "text": true, "showValue": true, "hideNarrow": true },
+        { "control": "subtitles", "text": true, "label": "sub" },
+        { "control": "audio", "text": true, "label": "aud" },
+        { "control": "video", "text": true, "label": "vo" },
+        { "control": "tier", "text": true, "label": "dec", "hideNarrow": true },
+        { "control": "stats", "label": "stats", "hideNarrow": true },
+        { "control": "mute", "text": true },
+        { "control": "volume", "hideNarrow": true },
+        { "control": "skins", "text": true, "label": "skin" },
+        { "control": "open", "text": true },
+        { "control": "fullscreen", "text": true }
+      ]
+    ]
+  },
+  "osd": { "position": "top-left" },
+  "autohide": 2000,
+  "seekbar": { "thumbnails": false }
+}
