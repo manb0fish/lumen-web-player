@@ -812,7 +812,12 @@ function remux(m: any): void {
     '-f',
     'mp4',
     '-movflags',
-    '+frag_keyframe+empty_moov+default_base_moof+frag_discont',
+    // negative_cts_offsets: with the timestamp shift disabled the muxer keeps its edit-list mode,
+    // in which a fragment's base time is the *presentation* time of its first packet and the
+    // decode-to-presentation delay is meant to be taken back out by an edit list. An empty moov
+    // has none, so every picture of a stream with B-frames landed that delay too late (two frames
+    // for typical H.264). Signed composition offsets make base time + offset the real PTS.
+    '+frag_keyframe+empty_moov+default_base_moof+frag_discont+negative_cts_offsets',
     '-frag_duration',
     '500000',
     '/dev/lumen_m',

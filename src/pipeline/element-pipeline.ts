@@ -13,13 +13,14 @@ export interface MseFeeder {
   readonly name: string;
   /**
    * Begin producing. `push` resolves once the bytes are appended and the buffer has room for more.
-   * `done(error?)` is called once when the stream is complete or failed.
+   * `done(error?)` is called once when the stream is complete or failed. `partial` marks a failure
+   * that came after output had been produced: fatal only if none of that output is playable.
    */
   start(
     gen: number,
     time: number,
     push: (data: ArrayBuffer, gen: number) => Promise<void>,
-    done: (gen: number, error?: string) => void,
+    done: (gen: number, error?: string, partial?: boolean) => void,
   ): void;
   stop(): void | Promise<void>;
   destroy(): void;
@@ -81,7 +82,7 @@ export class FfmpegFeeder implements MseFeeder {
     gen: number,
     time: number,
     push: (data: ArrayBuffer, gen: number) => Promise<void>,
-    done: (gen: number, error?: string) => void,
+    done: (gen: number, error?: string, partial?: boolean) => void,
   ): void {
     let chain: Promise<void> = Promise.resolve();
     this.pendingPushes = 0;
@@ -104,8 +105,17 @@ export class FfmpegFeeder implements MseFeeder {
       if (m.gen !== gen) return;
       this.running = false;
       if (m.aborted) return;
-      const failed = m.code !== 0 && !m.bytes;
-      chain = chain.then(() => done(gen, failed ? `FFmpeg remux failed (exit ${m.code})${m.log ? ': ' + m.log : ''}` : undefined));
+      // A run that fails near the end of a damaged file has still delivered nearly all of it, but
+      // one that fails on its first packets (a stream copy the MP4 muxer refuses, such as video
+      // without presentation timestamps) leaves an init segment and nothing to play. The byte
+      // count cannot tell the two apart; the pipeline, which sees the buffer, can.
+      const error = m.code !== 0 ? `FFmpeg remux failed (exit ${m.code})${m.log ? ': ' + m.log : ''}` : undefined;
+      // Exit code -1 is the core's "never exited" value: FFmpeg died on an assertion or a trap
+      // instead of leaving through its own exit path, so it cleaned nothing up and the instance
+      // cannot run anything else, in particular not the software decode the player would fall
+      // back to. Replace the worker before reporting.
+      if (m.code === -1) chain = chain.then(() => this.client.restart().catch(() => {}));
+      chain = chain.then(() => done(gen, error, !!m.bytes));
     };
     this.client.onFailed = (message) => done(gen, message);
     this.client.remux({
@@ -321,9 +331,11 @@ export class ElementPipeline implements Pipeline {
       gen,
       time,
       (data, g) => this.append(data, g),
-      (g, error) => {
+      (g, error, partial) => {
         if (g !== this.feedGen || this.destroyed) return;
-        if (error) {
+        // Every append has settled by now (the feeder chains this call behind them), so an empty
+        // buffer means the producer failed before it delivered anything playable.
+        if (error && !(partial && this.element.buffered.length > 0)) {
           this.o.cb.onError(error, 'mse-feed');
           return;
         }

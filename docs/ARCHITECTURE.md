@@ -115,7 +115,13 @@ Details that mattered in practice:
 - libavformat buffers 256 KiB per "file" output, which starved audio while video blocked on
   back-pressure → `-flush_packets 1`.
 - For stream-copy into MSE the muxer must keep source timestamps so fragments land at their real
-  position: `-copyts -start_at_zero -avoid_negative_ts disabled -movflags +frag_discont`.
+  position: `-copyts -start_at_zero -avoid_negative_ts disabled -movflags +frag_discont`. With the
+  shift disabled the muxer stays in its edit-list mode, where a fragment starts at the presentation
+  time of its first packet and an edit list is expected to take the B-frame delay back out; an
+  empty `moov` has none, so `+negative_cts_offsets` is needed as well, or every picture of a stream
+  with B-frames is shown that delay too late (two frames for typical H.264).
+- A stream copy that FFmpeg aborts on (video without presentation timestamps, such as B-frames in
+  AVI) leaves the core unusable: the worker is replaced before the player falls back.
 - Containers without a key-frame index (MPEG-TS…) can seek *past* the target; those get a 3 s
   decode pre-roll that is trimmed with `trim/atrim`.
 - The core is probed for its decoder list at start-up; a codec it cannot software-decode is
@@ -262,8 +268,8 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 - MP4 `tx3g` / non-Matroska embedded text subtitles are not extracted (external files work).
 - Pixel aspect ratio other than 1:1 is not applied by the canvas renderers.
 - HDR is tone-mapped to SDR; there is no HDR canvas output path yet.
-- After a seek on the FFmpeg stream-copy → MSE route (`wasm-remux-mse`), H.264 with B-frames is
-  shown two frames behind the clock (about 66 ms at 30 fps); playback from the start is exact, and
-  the software-decode and Mediabunny remux routes are frame-exact after seeks too.
+- FLV and AVI files whose video has B-frames do not start at position 0 on the FFmpeg routes:
+  FFmpeg aims its seek a little before the target, these two demuxers fail a seek to before the
+  start, and reading resumes at the second key frame. Opened or sought further in, they play.
 - Without cross-origin isolation the FFmpeg tier is single-threaded and decodes in slices: fine
   for 1080p H.264, not fast enough for 1080p 10-bit HEVC.
