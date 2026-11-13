@@ -67,8 +67,9 @@
         "video",
         { "control": "tier", "hideNarrow": true },
         { "control": "stats", "hideNarrow": true },
-        "skins",
-        "open",
+        { "control": "skins", "hideNarrow": true },
+        { "control": "open", "hideNarrow": true },
+        "more",
         "fullscreen"
       ]
     ]

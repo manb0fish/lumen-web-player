@@ -32,6 +32,9 @@ Ce qu'il sait faire :
   petit fichier JSON.
 - **Se piloter au clavier.** Les mêmes raccourcis que mpv : avance image par image, vitesse de
   lecture, décalage des sous-titres, boucle A-B, etc.
+- **Fonctionner sur téléphone et tablette.** Les commandes se réorganisent d'elles-mêmes sur les
+  petits écrans et répondent au toucher : touchez deux fois à gauche ou à droite de l'image pour
+  sauter 10 secondes.
 - **Montrer ce qui se passe à l'intérieur.** Appuyez sur `i` pour ouvrir un panneau de
   statistiques en direct.
 
@@ -194,7 +197,7 @@ Pour aller plus loin (en anglais) :
   d'habillages, suite de tests.
 - [Architecture](../ARCHITECTURE.md) : fonctionnement du décodage, du rendu, de la
   synchronisation audio et des sous-titres, et les compromis retenus.
-- [Vérification](../VERIFICATION.md) : ce que mesurent les 163 tests automatisés, et leurs
+- [Vérification](../VERIFICATION.md) : ce que mesurent les 186 tests automatisés, et leurs
   résultats.
 
 ## Auteurs

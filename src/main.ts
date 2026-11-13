@@ -4,18 +4,22 @@
  * URL parameters (all optional):
  *   src=<url>            media to load          autoplay=0     do not start automatically
  *   tier=auto|webcodecs|mse|wasm|native         renderer=auto|webgpu|webgl2|canvas2d
- *   wasm=auto|sw|remux   force an FFmpeg strategy  threads=1   use the pthread FFmpeg core
+ *   wasm=auto|sw|remux   force an FFmpeg strategy  threads=0|1 single- / multi-threaded FFmpeg core
  *   skin=glass|mpv|studio                       sub=<url>      external subtitle to add
  *   sidebar=0            hide the sample list   persist=0      do not touch localStorage
- *   nosab                serve the page without cross-origin isolation (no SharedArrayBuffer)
+ *   nosab                run without cross-origin isolation (no SharedArrayBuffer)
  */
 import { Player } from './core/player';
 import type { RendererRequest, TierRequest } from './core/types';
 import type { WasmMode } from './pipeline/router';
 import './element'; // registers <lumen-player>
+import { ensureCrossOriginIsolation } from './isolate';
 import { mountUI } from './ui';
 
 const q = new URLSearchParams(location.search);
+// On a host that does not send the isolation headers, a service worker adds them (one reload on
+// the first visit). Without isolation FFmpeg has no threads and cannot stream; see the guide.
+if (!q.has('nosab')) void ensureCrossOriginIsolation(new URL('lumen-isolation-sw.js', document.baseURI).href);
 const root = document.getElementById('player')!;
 const app = document.getElementById('app')!;
 if (q.get('sidebar') === '0') app.dataset.sidebar = 'off';
@@ -25,7 +29,7 @@ const player = new Player({
   renderer: (q.get('renderer') as RendererRequest) ?? 'auto',
   tier: (q.get('tier') as TierRequest) ?? 'auto',
   wasmMode: (q.get('wasm') as WasmMode) ?? 'auto',
-  wasmThreads: q.get('threads') === '1',
+  wasmThreads: q.has('threads') ? q.get('threads') === '1' : undefined,
   injectWebCodecsFaultAfter: Number(q.get('fault')) || undefined,
 });
 const ui = mountUI(player, root, { skin: q.get('skin') ?? undefined, persist: q.get('persist') !== '0' });
@@ -48,10 +52,24 @@ interface ManifestFile {
   subtitles?: string[];
   long?: boolean;
   channels?: number;
+  perf?: boolean;
 }
 
 const nav = document.getElementById('samples')!;
 let activeButton: HTMLButtonElement | null = null;
+
+// On small screens the sample list is a drawer (see index.html); the tab on the edge opens it.
+const drawerTab = document.getElementById('drawer-tab')!;
+function setDrawer(open: boolean): void {
+  if (open) app.dataset.drawer = 'open';
+  else delete app.dataset.drawer;
+  drawerTab.setAttribute('aria-expanded', String(open));
+}
+drawerTab.addEventListener('click', () => setDrawer(app.dataset.drawer !== 'open'));
+document.getElementById('scrim')!.addEventListener('click', () => setDrawer(false));
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') setDrawer(false);
+});
 
 function section(title: string): void {
   const h = document.createElement('h3');
@@ -76,6 +94,7 @@ function play(file: string, b: HTMLButtonElement): void {
   activeButton = b;
   b.dataset.active = 'true';
   player.load(`/media/${file}`, { autoplay: true }).catch(() => {});
+  setDrawer(false);
   root.focus({ preventScroll: true });
 }
 
@@ -94,7 +113,8 @@ async function buildSamples(): Promise<void> {
   const tag = (f: ManifestFile) =>
     [f.video ? `${f.video}${f.bitDepth && f.bitDepth > 8 ? '·' + f.bitDepth : ''}` : null, f.audio].filter(Boolean).join(' + ');
   const groups: Array<[string, (f: ManifestFile) => boolean]> = [
-    ['Video', (f) => !!f.video && !f.colors && !f.subtitles],
+    ['Video', (f) => !!f.video && !f.colors && !f.subtitles && !f.perf],
+    ['1080p (performance)', (f) => !!f.perf],
     ['Subtitles (embedded)', (f) => !!f.subtitles],
     ['Colour & HDR', (f) => !!f.colors],
     ['Audio only', (f) => !f.video],

@@ -35,7 +35,10 @@ export interface PlayerOptions {
   tier?: TierRequest;
   /** Force a specific FFmpeg-WASM strategy (mostly for testing). */
   wasmMode?: WasmMode;
-  /** Use the pthread FFmpeg core when the page is cross-origin isolated. */
+  /**
+   * Multi-threaded FFmpeg core (needs a cross-origin isolated page). Default: on where the machine
+   * has at least four logical cores; `false` forces the single-thread core.
+   */
   wasmThreads?: boolean;
   /** Tone-map HDR in our own shaders when frames can be read back as planes. */
   hdrShader?: boolean;
@@ -295,12 +298,19 @@ export class Player {
     const ff = new FfmpegClient();
     this.ffmpeg = ff;
     this.note('loading FFmpeg WebAssembly core…');
-    await ff.init({ multiThread: !!this.opts.wasmThreads });
+    // Threads by default wherever they can work (the client falls back to the single-thread core
+    // when the page is not cross-origin isolated or the pthread core fails to start).
+    const threads = this.opts.wasmThreads ?? (navigator.hardwareConcurrency || 4) >= 4;
+    await ff.init({ multiThread: threads });
     await ff.open(this.source!, this.sourceExt);
     this.ffmpegInfo = await ff.probe();
     this.note(
       `FFmpeg core ready (${ff.multiThread ? 'pthreads' : 'single-thread'}, ${ff.shared ? 'SharedArrayBuffer flow control' : 'segmented, no SharedArrayBuffer'})`,
     );
+    if (ff.io) this.note(`FFmpeg input: ${ff.io}`);
+    if (!ff.shared) {
+      this.note('this page is not cross-origin isolated: FFmpeg decodes on one thread, in slices (guide: "Cross-origin isolation")');
+    }
     return ff;
   }
 

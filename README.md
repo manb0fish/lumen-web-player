@@ -28,6 +28,8 @@ What it can do:
 - **Change its look.** Three built-in skins, and you can make your own with a small JSON file.
 - **Be driven from the keyboard.** The same shortcuts as mpv: frame-by-frame stepping, speed
   control, subtitle delay, A-B loop and more.
+- **Work on phones and tablets.** The controls rearrange themselves for small screens and respond
+  to touch: double-tap the left or right side of the picture to skip 10 seconds.
 - **Show what is going on inside.** Press `i` for a live "stats for nerds" panel.
 
 | Modern Glass | mpv OSC (with stats) | Studio Deck |
@@ -174,7 +176,7 @@ Where to read more:
 - [Guide](docs/GUIDE.md) — URL options, all shortcuts, embedding, writing skins, the test suite.
 - [Architecture](docs/ARCHITECTURE.md) — how decoding, rendering, audio sync and subtitles work,
   and the trade-offs behind them.
-- [Verification](docs/VERIFICATION.md) — what the 163 automated tests measure, and the results.
+- [Verification](docs/VERIFICATION.md) — what the 186 automated tests measure, and the results.
 
 ## Authors
 

@@ -32,6 +32,8 @@ O que ele faz:
 - **Muda de aparência.** Vem com três temas, e você pode criar o seu com um pequeno arquivo JSON.
 - **Pode ser controlado pelo teclado.** Os mesmos atalhos do mpv: avanço quadro a quadro,
   controle de velocidade, atraso de legenda, loop A-B e mais.
+- **Funciona em celulares e tablets.** Os controles se reorganizam sozinhos em telas pequenas e
+  respondem ao toque: toque duas vezes à esquerda ou à direita da imagem para pular 10 segundos.
 - **Mostra o que acontece por dentro.** Pressione `i` para abrir um painel de estatísticas em
   tempo real.
 
@@ -190,7 +192,7 @@ Para saber mais (em inglês):
   temas e o conjunto de testes.
 - [Arquitetura](../ARCHITECTURE.md): como funcionam a decodificação, a renderização, a
   sincronia de áudio e as legendas, e as escolhas de projeto por trás delas.
-- [Verificação](../VERIFICATION.md): o que os 163 testes automatizados medem e os resultados.
+- [Verificação](../VERIFICATION.md): o que os 186 testes automatizados medem e os resultados.
 
 ## Autores
 

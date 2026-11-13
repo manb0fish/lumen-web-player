@@ -5,6 +5,8 @@ export interface MenuItem {
   checked?: boolean;
   /** Keep the menu open (and rebuild it) after selecting — for toggles. */
   keepOpen?: boolean;
+  /** Replace the menu's contents with another list (a "Back" entry is added on top). */
+  submenu?: () => MenuItem[];
   onSelect?: () => void;
 }
 
@@ -18,7 +20,10 @@ export function isMenuOpen(): boolean {
   return closeCurrent !== null;
 }
 
-/** Open a popover menu anchored above (or below) `anchor`, inside the player root. */
+/**
+ * Open a popover menu anchored above (or below) `anchor`, inside the player root. On a compact
+ * player the stylesheet turns it into a sheet along the bottom edge instead.
+ */
 export function openMenu(root: HTMLElement, anchor: HTMLElement, build: () => MenuItem[]): void {
   const reopening = closeCurrent && (anchor as any).__lpMenuOpen;
   closeMenu();
@@ -31,9 +36,25 @@ export function openMenu(root: HTMLElement, anchor: HTMLElement, build: () => Me
   menu.dataset.lpChrome = '';
   menu.dataset.lpScroll = '';
 
+  // The list being shown; submenus push onto it and "Back" pops.
+  const stack: Array<() => MenuItem[]> = [build];
+
   const render = () => {
     menu.textContent = '';
-    for (const item of build()) {
+    const items = stack[stack.length - 1]();
+    if (stack.length > 1) {
+      items.unshift(
+        {
+          label: '‹  Back',
+          keepOpen: true,
+          onSelect: () => {
+            stack.pop();
+          },
+        },
+        { type: 'separator' },
+      );
+    }
+    for (const item of items) {
       if (item.type === 'separator') {
         const sep = document.createElement('div');
         sep.className = 'lp-menu-sep';
@@ -59,23 +80,27 @@ export function openMenu(root: HTMLElement, anchor: HTMLElement, build: () => Me
       label.className = 'lp-menu-label';
       label.textContent = item.label ?? '';
       b.append(check, label);
-      if (item.hint) {
+      const hintText = item.hint ?? (item.submenu ? '›' : '');
+      if (hintText) {
         const hint = document.createElement('span');
         hint.className = 'lp-menu-hint';
-        hint.textContent = item.hint;
+        hint.textContent = hintText;
         b.appendChild(hint);
       }
       b.addEventListener('click', (e) => {
         e.stopPropagation();
         item.onSelect?.();
-        if (item.keepOpen) queueMicrotask(render);
-        else closeMenu();
+        if (item.submenu) stack.push(item.submenu);
+        if (item.submenu || item.keepOpen) {
+          queueMicrotask(() => {
+            render();
+            place();
+          });
+        } else closeMenu();
       });
       menu.appendChild(b);
     }
   };
-  render();
-  overlay.appendChild(menu);
 
   const place = () => {
     const r = root.getBoundingClientRect();
@@ -96,6 +121,9 @@ export function openMenu(root: HTMLElement, anchor: HTMLElement, build: () => Me
     }
     menu.style.left = `${left}px`;
   };
+
+  render();
+  overlay.appendChild(menu);
   place();
 
   const onDown = (e: Event) => {

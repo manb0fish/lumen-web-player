@@ -68,3 +68,35 @@
   /* clear the title bar */
   padding-top: 58px;
 }
+
+/* compact: a phone held upright */
+.lp-root[data-skin='glass'][data-size='compact'] .lp-region-top {
+  padding: 8px 8px 22px 12px;
+}
+.lp-root[data-skin='glass'][data-size='compact'] .lp-region-bottom {
+  margin: 0 8px 8px;
+  padding: 4px 6px 6px;
+}
+.lp-root[data-skin='glass'][data-size='compact'] .lp-osd {
+  padding-top: 54px;
+}
+/* a very narrow player: the elapsed time alone */
+@container (max-width: 350px) {
+  .lp-root[data-skin='glass'] .lp-time-sep,
+  .lp-root[data-skin='glass'] .lp-time-duration {
+    display: none;
+  }
+}
+/* short: a phone held sideways */
+.lp-root[data-skin='glass'][data-short] .lp-region-top {
+  padding-top: 6px;
+  padding-bottom: 16px;
+}
+.lp-root[data-skin='glass'][data-short] .lp-region-bottom {
+  margin-bottom: 6px;
+}
+.lp-root[data-skin='glass'][data-short] .lp-big-play {
+  width: 64px;
+  height: 64px;
+  --lp-icon-size: 28px;
+}

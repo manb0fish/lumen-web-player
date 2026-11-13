@@ -28,3 +28,4 @@ export {
   type ControlFactory,
 } from './ui';
 export { LumenPlayerElement } from './element';
+export { ensureCrossOriginIsolation, type IsolationResult } from './isolate';

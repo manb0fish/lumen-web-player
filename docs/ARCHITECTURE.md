@@ -121,6 +121,54 @@ Details that mattered in practice:
 - The core is probed for its decoder list at start-up; a codec it cannot software-decode is
   reported up front rather than discovered as a stall.
 
+### Threads
+
+The multi-threaded core (`@ffmpeg/core-mt`) is the default wherever it can run: a cross-origin
+isolated page on a machine with at least four logical cores. Measured on the 1080p benchmark
+clips, the decoder alone manages about 42 frames per second of 10-bit HEVC on one thread (barely
+above real time, so any hiccup shows) and more than 110 with threads; H.264 goes from about 70 to
+more than 110. If the threaded core fails to start, the single-thread core takes over.
+
+### Reading the input
+
+FFmpeg pulls its input through synchronous `read()` calls of about 32 KiB, on the thread that
+demuxes and decodes. Handing those straight to a `File` on a network share, or downloading a URL
+in full before starting (what the first version did), either stalls the decoder on every read or
+delays the first frame by the length of the download. Reads therefore go through a block cache
+(`ffmpeg-io.ts`, 256 KiB blocks, 48 MiB):
+
+- A **read-ahead worker** (`io-worker.ts`) streams the source — one HTTP range request, or a
+  stream over the `Blob` — and keeps a 16 MiB window of blocks ready in front of the reader. It
+  follows the reader by the position the reader publishes; when the first missing block is not
+  where the current stream is heading, the stream is reopened there. A seek costs one request;
+  steady playback is one long download that pauses, by not reading, when the window is full.
+- **With SharedArrayBuffer** the cache is shared memory. The worker writes blocks into slots it
+  has claimed (free → filling → ready), and only the reader frees ready slots, so a slot's bytes
+  never change while the reader can see it and no lock is needed. FFmpeg's `read()` becomes a
+  `memcpy`; it waits (on `Atomics.wait`, abortable by a seek) only when it overtakes the network.
+- **Without it** nothing can reach a worker that is inside `exec()`, but a second worker can still
+  download in parallel. It posts the blocks, and they are picked up between two `exec()` calls.
+  Each slice therefore waits (asynchronously, before it starts) until the read-ahead worker has
+  brought in the part of the file it is about to decode, estimated from its position, and then
+  decodes without stopping; anything still missing is fetched synchronously in small pieces. The
+  read-ahead worker cannot see the decoder's cache in this mode, so the decoder tells it exactly
+  which blocks it evicted and which it fetched itself. Guessing instead made the download jump
+  back and forth between the file header, which every slice re-reads, and the data.
+- A server that ignores range requests is detected at open; the file is then downloaded once and
+  read from memory as before.
+
+Eviction is least-recently-used but never touches the window around the reader, so read-ahead
+cannot push out blocks that have not been read yet.
+
+### Without cross-origin isolation
+
+No SharedArrayBuffer means no threads and no way to pace a running `exec()`, so decoding happens
+in self-contained slices. A slice that starts in the middle of a GOP must decode from the previous
+key frame again, which is why slices are made as long as memory allows (about 192 MB of frames on
+machines with 8 GB or more). This path is a fallback: 1080p H.264 plays, 10-bit HEVC at 1080p does
+not keep up on one thread. The demo page therefore turns isolation on by itself where the server
+does not (see "Cross-origin isolation" in the guide).
+
 ## 4. A/V sync
 
 - The **AudioWorklet is the master clock**. It reports `(mediaTime, contextTime, rate)`; the main
@@ -129,6 +177,13 @@ Details that mattered in practice:
   because the raw pair jitters by a few milliseconds.
 - Video is scheduled against the **vsync-aligned rAF timestamp plus one refresh** (when the frame
   actually reaches the glass), not against "now". This removed cadence beating at 60 fps.
+- A source that decodes audio and video in one process (FFmpeg) delivers them in file order and
+  stops when the picture queue is full. After an audio underrun that used to be a standoff: the
+  player wanted 0.3 s of audio before restarting the clock, the ten 1080p frames that fill the
+  queue come with about 0.29 s, and no more could arrive because the queue was full and the clock
+  stopped. While audio is short and the queue is full, the pipeline now lets extra pictures
+  through (up to about three seconds or 256 MB) and takes the allowance back once audio is
+  plentiful. Files that interleave audio and video coarsely need the same slack.
 - The clock is **held** (not just the picture) during preroll and whenever video or audio runs
   dry, so the two cannot drift while rebuffering. A watchdog reports a decoder that never
   produces a frame instead of waiting forever.
@@ -207,3 +262,8 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 - MP4 `tx3g` / non-Matroska embedded text subtitles are not extracted (external files work).
 - Pixel aspect ratio other than 1:1 is not applied by the canvas renderers.
 - HDR is tone-mapped to SDR; there is no HDR canvas output path yet.
+- After a seek on the FFmpeg stream-copy → MSE route (`wasm-remux-mse`), H.264 with B-frames is
+  shown two frames behind the clock (about 66 ms at 30 fps); playback from the start is exact, and
+  the software-decode and Mediabunny remux routes are frame-exact after seeks too.
+- Without cross-origin isolation the FFmpeg tier is single-threaded and decodes in slices: fine
+  for 1080p H.264, not fast enough for 1080p 10-bit HEVC.
