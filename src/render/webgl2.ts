@@ -1,6 +1,28 @@
 import type { MediaFrame, PlanarFrame, RenderSettings } from '../core/types';
-import { describeChain, frameDisplaySize, kernelCode, primariesCode, rotationCode, toneMapCode, transferCode, yuvUniforms } from './color';
-import { GLSL_DEBAND, GLSL_EASU, GLSL_FINAL, GLSL_INGEST_EXTERNAL, GLSL_INGEST_PLANAR, GLSL_SCALE, GLSL_VERT } from './glsl';
+import {
+  describeChain,
+  type ExternalPacking,
+  frameDisplaySize,
+  gamutMapCode,
+  kernelCode,
+  packingCode,
+  primariesCode,
+  rotationCode,
+  toneMapCode,
+  transferCode,
+  yuvUniforms,
+} from './color';
+import { classifyExternal, ExternalHdrTracker, PROBE_SIZE, PROBE_TILE, probeOrigins, sampleBrowserSdr } from './external-hdr';
+import {
+  GLSL_DEBAND,
+  GLSL_EASU,
+  GLSL_FINAL,
+  GLSL_INGEST_EXTERNAL,
+  GLSL_INGEST_PLANAR,
+  GLSL_PROBE_EXTERNAL,
+  GLSL_SCALE,
+  GLSL_VERT,
+} from './glsl';
 import { copyCanvas, countTexture, makeCanvas, newStats, type Renderer, type RendererStats } from './renderer';
 
 interface Program {
@@ -22,7 +44,12 @@ interface Plane {
   wide: boolean;
 }
 
-/** WebGL2 fallback renderer: same pass chain as WebGPU, GLSL ES 3.00, RGBA16F intermediates when available. */
+/**
+ * WebGL2 fallback renderer: same pass chain as WebGPU, GLSL ES 3.00, RGBA16F intermediates when
+ * available. HDR frames decoded by the browser arrive here as coded samples too, but only 8 bits
+ * of them (texImage2D quantises whatever the target format): colours are right, fine gradients
+ * can band where WebGPU's stay smooth.
+ */
 export class WebGL2Renderer implements Renderer {
   readonly kind = 'webgl2' as const;
   readonly canvas = makeCanvas();
@@ -38,6 +65,10 @@ export class WebGL2Renderer implements Renderer {
   private pScale!: Program;
   private pEasu!: Program;
   private pFinal!: Program;
+  private pProbe!: Program;
+  private probe: Target | null = null;
+  private extHdr = new ExternalHdrTracker('webgl2');
+  private probeTimer = 0;
   private floatTargets = false;
   private targets: Record<'A' | 'B' | 'C', Target | null> = { A: null, B: null, C: null };
   private planes: Array<Plane | null> = [null, null, null];
@@ -72,7 +103,8 @@ export class WebGL2Renderer implements Renderer {
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
-    this.pExt = this.program('ingest-external', GLSL_INGEST_EXTERNAL, ['uTex', 'uRot']);
+    this.pExt = this.program('ingest-external', GLSL_INGEST_EXTERNAL, ['uTex', 'uMode', 'uOpt', 'uPeak']);
+    this.pProbe = this.program('probe-external', GLSL_PROBE_EXTERNAL, ['uTex', 'uOx', 'uOy', 'uTile']);
     this.pPlanar = this.program('ingest-planar', GLSL_INGEST_PLANAR, [
       'uTexY',
       'uTexU',
@@ -85,6 +117,7 @@ export class WebGL2Renderer implements Renderer {
       'uPack',
       'uPeak',
       'uMode',
+      'uGamut',
     ]);
     this.pDeband = this.program('deband', GLSL_DEBAND, ['uTex', 'uP']);
     this.pScale = this.program('scale', GLSL_SCALE, ['uTex', 'uSize', 'uOpt']);
@@ -220,6 +253,7 @@ export class WebGL2Renderer implements Renderer {
     const rot = rotationCode(frame.rotation);
     this.frameNo++;
     gl.bindVertexArray(this.vao);
+    let packing: ExternalPacking = 'converted';
 
     const A = this.target('A', disp.width, disp.height);
 
@@ -240,20 +274,28 @@ export class WebGL2Renderer implements Renderer {
       gl.uniform2f(p.u.uPack, yuv.pack[0], yuv.pack[1]);
       gl.uniform1f(p.u.uPeak, settings.hdrPeak);
       gl.uniform4i(p.u.uMode, transferCode(frame.color), primariesCode(frame.color), toneMapCode(settings.toneMapping), rot);
+      gl.uniform1i(p.u.uGamut, gamutMapCode(settings.gamutMapping));
       this.draw(A.fbo, A.w, A.h);
     } else {
       if (!this.extTex) this.extTex = this.newTexture(gl.LINEAR);
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.extTex);
+      const src = frame.kind === 'videoframe' ? frame.frame : frame.el;
       try {
-        const src = frame.kind === 'videoframe' ? frame.frame : frame.el;
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src as TexImageSource);
       } catch {
         return;
       }
+      // Reading back is synchronous here, so even the first frame is drawn with a checked packing.
+      if (settings.externalHdr && this.extHdr.wantsProbe(frame, t0)) this.probeExternal(src, frame, t0);
+      packing = settings.externalHdr ? this.extHdr.packingFor(frame) : 'converted';
       gl.useProgram(this.pExt.prog);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.extTex);
       gl.uniform1i(this.pExt.u.uTex, 0);
-      gl.uniform1i(this.pExt.u.uRot, rot);
+      gl.uniform4i(this.pExt.u.uMode, packingCode(packing), transferCode(frame.color), primariesCode(frame.color), rot);
+      gl.uniform2i(this.pExt.u.uOpt, toneMapCode(settings.toneMapping), gamutMapCode(settings.gamutMapping));
+      gl.uniform1f(this.pExt.u.uPeak, settings.hdrPeak);
       this.draw(A.fbo, A.w, A.h);
     }
     let cur: Target = A;
@@ -290,7 +332,55 @@ export class WebGL2Renderer implements Renderer {
     this.last = { frame, settings };
     this.stats.framesRendered++;
     this.stats.lastRenderMs = performance.now() - t0;
-    this.stats.chain = describeChain(frame, settings, outW, outH);
+    this.stats.chain = describeChain(frame, settings, outW, outH, packing);
+    if (frame.kind !== 'planar' && packing !== 'converted') this.stats.hdrHandover = this.extHdr.detail;
+    this.probeLater(frame, settings);
+  }
+
+  /** A paused player draws nothing new: come back by ourselves while a frame is still unchecked. */
+  private probeLater(frame: MediaFrame, settings: RenderSettings): void {
+    if (this.probeTimer || !settings.externalHdr) return;
+    const wait = this.extHdr.retryIn(frame, performance.now());
+    if (wait === null) return;
+    this.probeTimer = window.setTimeout(() => {
+      this.probeTimer = 0;
+      if (!this.destroyed && this.last) this.render(this.last.frame, this.last.settings);
+    }, wait + 30);
+  }
+
+  /**
+   * Compare the texture just uploaded from an HDR frame with the browser's 2D-canvas rendition of
+   * the same pixels (external-hdr.ts). Expects the upload to be bound to texture unit 0.
+   */
+  private probeExternal(src: VideoFrame | HTMLVideoElement, frame: MediaFrame, now: number): void {
+    const gl = this.gl;
+    const origins = probeOrigins(frame.width, frame.height);
+    if (!origins) {
+      this.extHdr.giveUp();
+      return;
+    }
+    const sdr = sampleBrowserSdr(src, origins);
+    if (!sdr) {
+      this.extHdr.miss(now);
+      return;
+    }
+    if (!this.probe) {
+      const tex = this.newTexture(gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, PROBE_SIZE, PROBE_SIZE, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      const fbo = gl.createFramebuffer()!;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      this.probe = { tex, fbo, w: PROBE_SIZE, h: PROBE_SIZE };
+    }
+    this.useWithTexture(this.pProbe, this.extTex!);
+    gl.uniform4f(this.pProbe.u.uOx, origins.x[0], origins.x[1], origins.x[2], origins.x[3]);
+    gl.uniform4f(this.pProbe.u.uOy, origins.y[0], origins.y[1], origins.y[2], origins.y[3]);
+    gl.uniform1i(this.pProbe.u.uTile, PROBE_TILE);
+    this.draw(this.probe.fbo, PROBE_SIZE, PROBE_SIZE);
+    const px = new Uint8Array(PROBE_SIZE * PROBE_SIZE * 4);
+    gl.readPixels(0, 0, PROBE_SIZE, PROBE_SIZE, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    this.extHdr.report(frame, classifyExternal(px, sdr, frame.color, this.extHdr.candidates()), now);
+    this.stats.hdrHandover = this.extHdr.detail;
   }
 
   snapshot(): HTMLCanvasElement | null {
@@ -301,6 +391,7 @@ export class WebGL2Renderer implements Renderer {
 
   forget(): void {
     this.last = null;
+    this.extHdr.reset();
   }
 
   destroy(): void {
@@ -308,6 +399,7 @@ export class WebGL2Renderer implements Renderer {
     this.destroyed = true;
     this.last = null;
     this.canvas.removeEventListener('webglcontextlost', this.onContextLost);
+    clearTimeout(this.probeTimer);
     const gl = this.gl;
     if (gl) {
       for (const key of ['A', 'B', 'C'] as const) {
@@ -327,7 +419,12 @@ export class WebGL2Renderer implements Renderer {
       }
       this.deleteTexture(this.extTex);
       this.extTex = null;
-      for (const p of [this.pExt, this.pPlanar, this.pDeband, this.pScale, this.pEasu, this.pFinal]) {
+      if (this.probe) {
+        this.deleteTexture(this.probe.tex);
+        gl.deleteFramebuffer(this.probe.fbo);
+        this.probe = null;
+      }
+      for (const p of [this.pExt, this.pPlanar, this.pDeband, this.pScale, this.pEasu, this.pFinal, this.pProbe]) {
         if (p) gl.deleteProgram(p.prog);
       }
       gl.deleteVertexArray(this.vao);

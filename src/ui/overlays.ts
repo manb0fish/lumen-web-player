@@ -60,6 +60,7 @@ export function formatStats(s: PlayerStats): string {
   out += `<span class="lp-stats-dim">${''.padEnd(13)}${esc(s.routeReason)}</span>\n`;
   out += row('Renderer', `${s.renderer ?? '-'}  —  ${s.rendererDetail}`);
   out += row('Shader chain', s.chain);
+  if (s.hdrHandover) out += row('HDR samples', s.hdrHandover);
   out += row('Container', s.container);
   out += row('Video', s.video);
   out += row('Audio', s.audio);

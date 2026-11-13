@@ -192,7 +192,7 @@ Para saber mais (em inglês):
   temas e o conjunto de testes.
 - [Arquitetura](../ARCHITECTURE.md): como funcionam a decodificação, a renderização, a
   sincronia de áudio e as legendas, e as escolhas de projeto por trás delas.
-- [Verificação](../VERIFICATION.md): o que os 186 testes automatizados medem e os resultados.
+- [Verificação](../VERIFICATION.md): o que os 202 testes automatizados medem e os resultados.
 
 ## Autores
 

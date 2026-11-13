@@ -1,19 +1,19 @@
 # Verification results
 
-Recorded 2026-11-12 on Windows 11 with Microsoft Edge 157 (headless) on a six-core desktop PC
+Recorded 2026-11-13 on Windows 11 with Microsoft Edge 157 (headless) on a six-core desktop PC
 with a discrete GPU (the sync and rendering measurements below are from the 2026-11-11 run). Reproduce with `npm run media` followed by `npm test` (dev server) or
 `npm run test:preview` (production build).
 
 | Run | Result |
 | --- | --- |
-| Dev server | **186 / 186 passed**, 0 flaky, 12.4 min |
-| Production build (`vite build` + `vite preview`) | **186 / 186 passed**, 0 flaky, 12.1 min |
+| Dev server | **202 / 202 passed**, 0 flaky, 12.6 min |
+| Production build (`vite build` + `vite preview`) | **202 / 202 passed**, 0 flaky, 12.4 min |
 
 | Spec | Tests |
 | --- | --- |
 | `01-matrix` — every container × codec on automatic routing | 25 |
-| `02-tiers` — forced WebCodecs / MSE / FFmpeg-WASM / native play-through | 24 |
-| `03-renderers` — WebGPU / WebGL2 / Canvas 2D, colour accuracy, HDR, shaders | 20 |
+| `02-tiers` — forced WebCodecs / MSE / FFmpeg-WASM / native play-through, exact frames after seeks on the remux route | 26 |
+| `03-renderers` — WebGPU / WebGL2 / Canvas 2D, colour accuracy, HDR on every decoding method, gamut mapping, shaders | 25 |
 | `04-sync` — A/V sync, speed, pitch, downmix | 12 |
 | `05-subtitles` — ASS / SRT / WebVTT / PGS, fonts, frame accuracy | 13 |
 | `06-ui` — skins, key bindings, stats, public API | 8 |
@@ -21,7 +21,7 @@ with a discrete GPU (the sync and rendering measurements below are from the 2026
 | `08-fallbacks` — degraded environments | 10 |
 | `09-mobile` — double-click, touch gestures, small screens | 9 |
 | `10-streaming` — network input, threads, cross-origin isolation | 9 |
-| `unit` — AudioWorklet DSP, input block cache and pure logic, in Node | 47 |
+| `unit` — AudioWorklet DSP, input block cache, HDR hand-over check and pure logic, in Node | 56 |
 
 ## Test media (synthesised with ffmpeg `lavfi`, 33 clips)
 
@@ -60,6 +60,7 @@ All of them rendered through WebGPU.
 | Frame on screen vs. audio clock (pixel truth), all tiers | mean 0.25–0.27 frames, worst 0.70 | within −2.3 … +1.5 frames |
 | Flash on screen vs. beep audible, WebCodecs | mean −6.5 ms, worst 12.9 ms | each < 45, mean < 25 |
 | Flash on screen vs. beep audible, FFmpeg WASM | mean −3.4 ms, worst 9.1 ms | each < 45, mean < 25 |
+| HDR colour and luminance patches decoded by the browser (WebCodecs, MSE) vs. software-decoded, WebGPU and WebGL2 | within 8 of 255 per channel | ≤ 12 |
 | 60 fps clip | 149 frames on 149 refreshes in 2.5 s, 2 skipped | ≥ 93 % of refreshes |
 | Longest stall while playing 21 routes end to end | 65 ms | < 900 ms |
 | WSOLA pitch at 0.5× … 3× (unit, 220 Hz tone) | 220.0 Hz, full amplitude | ± 0.5 Hz |

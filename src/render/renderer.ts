@@ -7,6 +7,8 @@ export interface RendererStats {
   /** CPU time spent issuing the last frame's draw calls. */
   lastRenderMs: number;
   chain: string;
+  /** How HDR frames decoded by the browser are being read (empty when none have been shown). */
+  hdrHandover: string;
 }
 
 /**
@@ -46,7 +48,7 @@ export function countTexture(stats: RendererStats, delta: 1 | -1): void {
 }
 
 export function newStats(): RendererStats {
-  return { texturesCreated: 0, texturesDestroyed: 0, framesRendered: 0, lastRenderMs: 0, chain: 'idle' };
+  return { texturesCreated: 0, texturesDestroyed: 0, framesRendered: 0, lastRenderMs: 0, chain: 'idle', hdrHandover: '' };
 }
 
 export function makeCanvas(): HTMLCanvasElement {

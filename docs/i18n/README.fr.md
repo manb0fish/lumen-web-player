@@ -197,7 +197,7 @@ Pour aller plus loin (en anglais) :
   d'habillages, suite de tests.
 - [Architecture](../ARCHITECTURE.md) : fonctionnement du décodage, du rendu, de la
   synchronisation audio et des sous-titres, et les compromis retenus.
-- [Vérification](../VERIFICATION.md) : ce que mesurent les 186 tests automatisés, et leurs
+- [Vérification](../VERIFICATION.md) : ce que mesurent les 202 tests automatisés, et leurs
   résultats.
 
 ## Auteurs

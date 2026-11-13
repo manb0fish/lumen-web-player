@@ -25,6 +25,7 @@ import {
   type RoutePlan,
   type Scaler,
   type TierRequest,
+  type GamutMap,
   type ToneMap,
 } from './types';
 
@@ -40,7 +41,10 @@ export interface PlayerOptions {
    * has at least four logical cores; `false` forces the single-thread core.
    */
   wasmThreads?: boolean;
-  /** Tone-map HDR in our own shaders when frames can be read back as planes. */
+  /**
+   * Tone-map HDR in our own shaders (default). `false` leaves HDR to the browser: frames are not
+   * read back as planes, and what its GPU import returns is drawn as it comes.
+   */
   hdrShader?: boolean;
   volume?: number;
   muted?: boolean;
@@ -86,6 +90,8 @@ export interface PlayerStats {
   renderer: string | null;
   rendererDetail: string;
   chain: string;
+  /** How HDR frames decoded by the browser are being read; empty when none have been shown. */
+  hdrHandover: string;
   container: string;
   video: string;
   audio: string;
@@ -129,6 +135,7 @@ function initialState(o: PlayerOptions): PlayerState {
     deband: DEFAULT_RENDER_SETTINGS.deband,
     sharpen: DEFAULT_RENDER_SETTINGS.sharpen,
     toneMapping: DEFAULT_RENDER_SETTINGS.toneMapping,
+    gamutMapping: DEFAULT_RENDER_SETTINGS.gamutMapping,
     dither: DEFAULT_RENDER_SETTINGS.dither,
     linearScaling: DEFAULT_RENDER_SETTINGS.linearScaling,
     normalize: false,
@@ -202,6 +209,7 @@ export class Player {
   constructor(opts: PlayerOptions) {
     this.opts = opts;
     this.wasmMode = opts.wasmMode ?? 'auto';
+    this.settings.externalHdr = opts.hdrShader !== false;
     this.store = new Store(initialState(opts));
     this.stage = document.createElement('div');
     this.stage.className = 'lp-stage';
@@ -999,6 +1007,7 @@ export class Player {
       renderer: s.renderer,
       rendererDetail: s.rendererDetail,
       chain: rs?.chain ?? (s.renderer === 'native' ? 'browser compositor' : 'idle'),
+      hdrHandover: rs?.hdrHandover ?? '',
       container: info ? `${info.container} (${info.demuxer})` : '-',
       video: v
         ? `${v.codec} ${v.width}x${v.height} ${v.fps}fps ${v.bitDepth}-bit${v.codecString ? ' [' + v.codecString + ']' : ''}`
@@ -1297,6 +1306,16 @@ export class Player {
         this.applySettings({ toneMapping: v });
       },
       osd: (v) => `Tone mapping: ${v}`,
+    });
+    c.defineProperty('gamut-mapping', {
+      type: 'choice',
+      choices: () => ['soft', 'clip'],
+      get: () => s().gamutMapping,
+      set: (v: GamutMap) => {
+        this.store.set({ gamutMapping: v });
+        this.applySettings({ gamutMapping: v });
+      },
+      osd: (v) => `Gamut mapping: ${v}`,
     });
     bool(
       'dither',

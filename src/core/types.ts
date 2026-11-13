@@ -121,6 +121,8 @@ export type MediaFrame = PlanarFrame | ExternalFrame | ElementFrame;
 
 export type Scaler = 'bilinear' | 'bicubic' | 'lanczos' | 'fsr';
 export type ToneMap = 'bt2390' | 'hable' | 'reinhard' | 'clip';
+/** Colours the display cannot show: compress saturation towards grey (keeps hue), or cut each channel off. */
+export type GamutMap = 'soft' | 'clip';
 
 export interface RenderSettings {
   scaler: Scaler;
@@ -128,11 +130,17 @@ export interface RenderSettings {
   /** 0..1, 0 disables the RCAS pass. */
   sharpen: number;
   toneMapping: ToneMap;
+  gamutMapping: GamutMap;
   dither: boolean;
   /** Scale in linear light instead of gamma light. */
   linearScaling: boolean;
   /** Assumed mastering peak for HDR sources, in nits. */
   hdrPeak: number;
+  /**
+   * Colour-manage HDR frames that the browser decoded (VideoFrame, <video>) in our shaders, like
+   * software-decoded ones. Off: draw whatever its import returns.
+   */
+  externalHdr: boolean;
 }
 
 export const DEFAULT_RENDER_SETTINGS: RenderSettings = {
@@ -140,9 +148,11 @@ export const DEFAULT_RENDER_SETTINGS: RenderSettings = {
   deband: false,
   sharpen: 0,
   toneMapping: 'bt2390',
+  gamutMapping: 'soft',
   dither: true,
   linearScaling: false,
   hdrPeak: 1000,
+  externalHdr: true,
 };
 
 export interface SubtitleTrackInfo {
@@ -181,6 +191,7 @@ export interface PlayerState {
   deband: boolean;
   sharpen: number;
   toneMapping: ToneMap;
+  gamutMapping: GamutMap;
   dither: boolean;
   linearScaling: boolean;
   normalize: boolean;

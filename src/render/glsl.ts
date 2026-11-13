@@ -31,27 +31,8 @@ float hash12(vec2 p) {
 }
 `;
 
-export const GLSL_INGEST_EXTERNAL = /* glsl */ `${HEAD}
-uniform sampler2D uTex;
-uniform int uRot;
-void main() {
-  vec2 uv = rotUv(vec2(vUv.x, 1.0 - vUv.y), uRot);
-  outColor = vec4(texture(uTex, uv).rgb, 1.0);
-}`;
-
-export const GLSL_INGEST_PLANAR = /* glsl */ `${HEAD}
-uniform sampler2D uTexY;
-uniform sampler2D uTexU;
-uniform sampler2D uTexV;
-uniform vec3 uM0;
-uniform vec3 uM1;
-uniform vec3 uM2;
-uniform vec3 uOff;
-uniform vec3 uScl;
-uniform vec2 uPack;
-uniform float uPeak;
-uniform ivec4 uMode;   // transfer, primaries, tone map, rotation
-
+/** Colour management shared by both ingest passes (see COLOR in wgsl.ts). */
+const COLOR = /* glsl */ `
 const float PQ_M1 = 0.1593017578125;
 const float PQ_M2 = 78.84375;
 const float PQ_C1 = 0.8359375;
@@ -104,6 +85,115 @@ float toneCurve(float x, float peak, int kind) {
   }
   return pqEotf1(e2 * srcPq) * 10000.0 / SDR_WHITE;
 }
+vec3 srgbEotfSigned(vec3 v) {
+  vec3 a = abs(v);
+  return sign(v) * mix(pow((a + 0.055) / 1.055, vec3(2.4)), a / 12.92, vec3(lessThanEqual(a, vec3(0.04045))));
+}
+
+const float GAMUT_KNEE = 0.95;
+vec3 gamutCompress(vec3 c, vec3 src) {
+  float a = max(c.r, max(c.g, c.b));
+  if (a <= 1e-6) return vec3(0.0);
+  float s = (a - min(c.r, min(c.g, c.b))) / a;
+  vec3 o = c;
+  if (s > GAMUT_KNEE) {
+    float own = (a - min(src.r, min(src.g, src.b))) / a;
+    float lim = max(s / max(own, 1e-4), 1.0001);
+    float k = (lim - GAMUT_KNEE) / pow(pow((1.0 - GAMUT_KNEE) / (lim - GAMUT_KNEE), -1.2) - 1.0, 1.0 / 1.2);
+    float nd = (s - GAMUT_KNEE) / k;
+    float s2 = GAMUT_KNEE + k * nd / pow(1.0 + pow(nd, 1.2), 1.0 / 1.2);
+    o = vec3(a) + (c - vec3(a)) * (s2 / s);
+  }
+  if (a > 1.0) {
+    float y = dot(o, vec3(0.2126, 0.7152, 0.0722));
+    o = mix(o, vec3(y), clamp((a - 1.0) / max(a - y, 1e-6), 0.0, 1.0));
+  }
+  return o;
+}
+
+// transfer: 0 sdr, 1 pq, 2 hlg.  primaries: 0 709, 1 2020, 2 p3.  tone: curve.  gamut: 0 clip, 1 soft.
+vec3 colorManage(vec3 coded, int transfer, int primaries, int tone, int gamut, float peakNits) {
+  vec3 lin;
+  if (transfer == 1) lin = pqEotf(clamp(coded, 0.0, 1.0)) * (10000.0 / SDR_WHITE);
+  else if (transfer == 2) lin = hlgToDisplay(clamp(coded, 0.0, 1.0)) * (1000.0 / SDR_WHITE);
+  else lin = pow(max(coded, vec3(0.0)), vec3(2.4));
+  if (transfer != 0) {
+    float peak = max(peakNits / SDR_WHITE, 1.0);
+    float m = max(max(lin.r, lin.g), max(lin.b, 1e-6));
+    lin *= toneCurve(min(m, peak), peak, tone) / m;
+  }
+  vec3 src = lin;
+  if (primaries == 1) {
+    lin = vec3(dot(vec3(1.660491, -0.587641, -0.072850), src),
+               dot(vec3(-0.124550, 1.132900, -0.008349), src),
+               dot(vec3(-0.018151, -0.100579, 1.118730), src));
+  } else if (primaries == 2) {
+    lin = vec3(dot(vec3(1.224940, -0.224940, 0.0), src),
+               dot(vec3(-0.042057, 1.042057, 0.0), src),
+               dot(vec3(-0.019638, -0.078636, 1.098274), src));
+  }
+  if (gamut == 1 && primaries != 0) lin = gamutCompress(lin, src);
+  return pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.4));
+}
+`;
+
+export const GLSL_INGEST_EXTERNAL = /* glsl */ `${HEAD}
+${COLOR}
+uniform sampler2D uTex;
+uniform ivec4 uMode;   // packing (0 converted by the browser, 1 coded, 2 coded behind matrix + sRGB OETF), transfer, primaries, rotation
+uniform ivec2 uOpt;    // tone map, gamut mapping
+uniform float uPeak;
+void main() {
+  vec2 uv = rotUv(vec2(vUv.x, 1.0 - vUv.y), uMode.w);
+  vec3 c = texture(uTex, uv).rgb;
+  if (uMode.x != 0) {
+    vec3 coded = c;
+    if (uMode.x == 2) {
+      vec3 v = srgbEotfSigned(c);
+      if (uMode.z == 1) {
+        coded = vec3(dot(vec3(0.627404, 0.329283, 0.043313), v),
+                     dot(vec3(0.069097, 0.919540, 0.011362), v),
+                     dot(vec3(0.016391, 0.088013, 0.895595), v));
+      } else if (uMode.z == 2) {
+        coded = vec3(dot(vec3(0.822462, 0.177538, 0.0), v),
+                     dot(vec3(0.033194, 0.966806, 0.0), v),
+                     dot(vec3(0.017083, 0.072397, 0.910520), v));
+      } else {
+        coded = v;
+      }
+    }
+    c = colorManage(coded, uMode.y, uMode.z, uOpt.x, uOpt.y, uPeak);
+  }
+  outColor = vec4(c, 1.0);
+}`;
+
+/** Reads tiles of the uploaded external texture 1:1 for the hand-over check (see WGSL_PROBE_EXTERNAL). */
+export const GLSL_PROBE_EXTERNAL = /* glsl */ `${HEAD}
+uniform sampler2D uTex;
+uniform vec4 uOx;      // left edge of each tile column
+uniform vec4 uOy;      // top edge of each tile row
+uniform int uTile;     // tile size
+void main() {
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  ivec2 tile = p / uTile;
+  ivec2 src = ivec2(int(uOx[tile.x]), int(uOy[tile.y])) + (p - tile * uTile);
+  outColor = vec4(texelFetch(uTex, src, 0).rgb, 1.0);
+}`;
+
+export const GLSL_INGEST_PLANAR = /* glsl */ `${HEAD}
+${COLOR}
+uniform sampler2D uTexY;
+uniform sampler2D uTexU;
+uniform sampler2D uTexV;
+uniform vec3 uM0;
+uniform vec3 uM1;
+uniform vec3 uM2;
+uniform vec3 uOff;
+uniform vec3 uScl;
+uniform vec2 uPack;
+uniform float uPeak;
+uniform ivec4 uMode;   // transfer, primaries, tone map, rotation
+uniform int uGamut;    // 0 clip, 1 soft
 
 void main() {
   vec2 uv = rotUv(vec2(vUv.x, 1.0 - vUv.y), uMode.w);
@@ -112,27 +202,7 @@ void main() {
   float cr = dot(texture(uTexV, uv).rg, uPack);
   vec3 yuv = (vec3(y, cb, cr) - uOff) * uScl;
   vec3 rgb = vec3(dot(uM0, yuv), dot(uM1, yuv), dot(uM2, yuv));
-  if (uMode.x != 0 || uMode.y != 0) {
-    vec3 lin;
-    if (uMode.x == 1) lin = pqEotf(clamp(rgb, 0.0, 1.0)) * (10000.0 / SDR_WHITE);
-    else if (uMode.x == 2) lin = hlgToDisplay(clamp(rgb, 0.0, 1.0)) * (1000.0 / SDR_WHITE);
-    else lin = pow(max(rgb, vec3(0.0)), vec3(2.4));
-    if (uMode.x != 0) {
-      float peak = max(uPeak / SDR_WHITE, 1.0);
-      float m = max(max(lin.r, lin.g), max(lin.b, 1e-6));
-      lin *= toneCurve(min(m, peak), peak, uMode.z) / m;
-    }
-    if (uMode.y == 1) {
-      lin = vec3(dot(vec3(1.6605, -0.5876, -0.0728), lin),
-                 dot(vec3(-0.1246, 1.1329, -0.0083), lin),
-                 dot(vec3(-0.0182, -0.1006, 1.1187), lin));
-    } else if (uMode.y == 2) {
-      lin = vec3(dot(vec3(1.2249, -0.2247, 0.0), lin),
-                 dot(vec3(-0.0420, 1.0419, 0.0), lin),
-                 dot(vec3(-0.0197, -0.0786, 1.0979), lin));
-    }
-    rgb = pow(clamp(lin, 0.0, 1.0), vec3(1.0 / 2.4));
-  }
+  if (uMode.x != 0 || uMode.y != 0) rgb = colorManage(rgb, uMode.x, uMode.y, uMode.z, uGamut, uPeak);
   outColor = vec4(rgb, 1.0);
 }`;
 

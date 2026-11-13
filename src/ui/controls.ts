@@ -632,6 +632,18 @@ function videoItems(ctx: ControlContext): MenuItem[] {
       onSelect: () => run(ctx, `set tone-mapping ${v}`),
     });
   }
+  items.push({ type: 'header', label: 'Wide gamut to display' });
+  for (const [v, label] of [
+    ['soft', 'Compress saturation (keeps hue)'],
+    ['clip', 'Clip'],
+  ]) {
+    items.push({
+      label,
+      checked: s.gamutMapping === v,
+      keepOpen: true,
+      onSelect: () => run(ctx, `set gamut-mapping ${v}`),
+    });
+  }
   return items;
 }
 

@@ -176,7 +176,7 @@ Where to read more:
 - [Guide](docs/GUIDE.md) — URL options, all shortcuts, embedding, writing skins, the test suite.
 - [Architecture](docs/ARCHITECTURE.md) — how decoding, rendering, audio sync and subtitles work,
   and the trade-offs behind them.
-- [Verification](docs/VERIFICATION.md) — what the 186 automated tests measure, and the results.
+- [Verification](docs/VERIFICATION.md) — what the 202 automated tests measure, and the results.
 
 ## Authors
 

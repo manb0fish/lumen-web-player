@@ -194,7 +194,7 @@ Más información (en inglés):
   batería de pruebas.
 - [Arquitectura](../ARCHITECTURE.md): cómo funcionan la decodificación, el renderizado, la
   sincronización de audio y los subtítulos, y las decisiones de diseño que hay detrás.
-- [Verificación](../VERIFICATION.md): qué miden las 186 pruebas automatizadas y sus resultados.
+- [Verificación](../VERIFICATION.md): qué miden las 202 pruebas automatizadas y sus resultados.
 
 ## Autores
 

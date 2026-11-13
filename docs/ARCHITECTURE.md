@@ -208,9 +208,50 @@ still works), or a `<video>` element. The pass chain is identical in WGSL and GL
 ingest ──► [deband] ──► [scale: bicubic | Lanczos-3 | EASU-style] ──► RCAS sharpen + dither ──► canvas
 ```
 
-The planar ingest shader does range expansion, BT.601/709/2020 matrices, PQ and HLG EOTFs, tone
-mapping (BT.2390, Hable, Reinhard, clip) and BT.2020/P3 → BT.709 gamut conversion. Intermediates
-are RGBA16F. Canvas 2D is the compatibility floor (CPU YUV→RGB for planar frames).
+The ingest pass is where colour is managed, by one shader function for every kind of frame:
+PQ and HLG EOTFs, tone mapping (BT.2390, Hable, Reinhard, clip) and BT.2020/P3 → BT.709 gamut
+mapping. For planar frames it follows range expansion and the BT.601/709/2020 matrix; for frames
+the browser decoded it follows the unpacking described below. Intermediates are RGBA16F. Canvas 2D
+is the compatibility floor (CPU YUV→RGB for planar frames, the browser's conversion for the rest).
+
+### HDR frames the browser decoded
+
+A `VideoFrame` or a `<video>` element reaches a shader through the browser's own import, and for
+HDR that import is not the conversion it is for SDR. Measured in Chromium (Edge, Windows; HEVC,
+AV1 and VP9; PQ and HLG; GPU-backed frames, which is what both hardware decoders and `<video>`
+deliver), for grey patches of 100 / 203 / 400 / 1000 nits:
+
+| Path | What arrives | On screen, untouched |
+| --- | --- | --- |
+| WebGPU `importExternalTexture` | sRGB-OETF(primaries → sRGB matrix × coded R′G′B′), float | 189 / 200 / 210 / 225 |
+| WebGL2 `texImage2D` | coded R′G′B′, 8 bit whatever the target format | 130 / 147 / 165 / 192 |
+| Canvas 2D `drawImage`, `copyTo(RGBA)` | tone-mapped SDR, mid-tones at half their light | 137 / 185 / 220 / 255 |
+| *our pipeline on software-decoded planes* | | 191 / 230 / 250 / 255 |
+
+The two GPU imports have no PQ or HLG transfer function, so they leave it out: the picture is
+code values shown as if they were SDR, flat and grey. That is why HDR used to look right only on
+the FFmpeg route. Both are exactly reversible (WebGPU's target is float, nothing is clipped), so
+the external ingest pass now undoes them and hands the coded samples to the same colour function
+as planar frames; the four routes then agree to within a few code values.
+
+Because none of this is specified, the renderer does not simply assume it (`external-hdr.ts`). It
+starts from the packing its API is known to produce in Chromium, then reads a few hundred pixels
+of an early frame both through the import and through a 2D canvas, the one conversion that is the
+browser's considered opinion. A packing is accepted only if the light it implies is a constant
+multiple of the canvas version in the mid-tones, where every tone curve is a straight line (the
+check holds with and without HDR10 static metadata, which only moves the highlights). If the
+import already equals the canvas, or fits nothing known, the frame is left as the browser made
+it. The verdict is shown in the stats overlay ("HDR samples").
+
+### Gamut mapping
+
+BT.2020 and P3 colours that BT.709 cannot show are not clipped per channel by default: saturation
+is compressed towards the grey of the same brightest channel, along a line of constant dominant
+wavelength, so that the edge of the source gamut lands on the edge of BT.709. Up to 95 % of the
+way to that edge nothing changes; beyond it the ACES reference-gamut-compression curve is used.
+Clipping turns every out-of-gamut green into the same BT.709 green and shifts hues towards the
+display primaries; this keeps hue and gradation. A highlight too saturated for display white
+gives up saturation rather than luminance. `set gamut-mapping clip` restores the old behaviour.
 
 Renderer creation degrades WebGPU → WebGL2 → Canvas 2D; a lost GPU context triggers the same
 chain at runtime.
@@ -258,7 +299,7 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 | **Single-thread FFmpeg core by default, pthread core opt-in** (`wasmThreads` / `?threads=1`) | The pthread core spins up a 32-worker pool at start; the single-thread core already exceeds real time on the test matrix. | Large software-decoded streams benefit from enabling threads. |
 | **mediabunny for demux/remux** | Maintained, streaming, covers MP4/MOV/MKV/WebM/TS/Ogg/MP3/FLAC/WAV, and can write fragmented MP4 for the MSE tier. | No AVI/FLV (→ FFmpeg), no subtitle tracks (→ own Matroska scanner). |
 | **JASSUB (libass WASM)** for ASS | Real libass = real compatibility with complex typesetting. | The first draw after the overlay is created or resized does not reach the screen unless another frame follows; the manager issues confirming repaints when paused. |
-| **External textures for SDR, own shaders for planar/HDR** | Zero-copy where the browser's conversion is correct; full control where it matters. | Hardware-decoded HDR frames whose pixel format cannot be read back use the browser's conversion; software-decoded HDR goes through our tone mapping. |
+| **External textures for SDR, own shaders for planar/HDR** | Zero-copy where the browser's conversion is correct; full control where it matters. | HDR frames that cannot be read back as planes are imported as the browser packs them and unpacked in the shader, which rests on unspecified behaviour: it is checked per stream against the browser's 2D-canvas conversion and abandoned when the check fails. |
 | **Matroska scan reads the file sequentially** | No index for subtitle blocks. | For URL sources the file is fetched once in the background to scan it. |
 | **Skin CSS scoping via native CSS nesting** | No build step for skin authors. | Requires browsers with CSS nesting (all current engines). |
 
@@ -267,7 +308,11 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 - Software AV1 decode in the FFmpeg tier (see above).
 - MP4 `tx3g` / non-Matroska embedded text subtitles are not extracted (external files work).
 - Pixel aspect ratio other than 1:1 is not applied by the canvas renderers.
-- HDR is tone-mapped to SDR; there is no HDR canvas output path yet.
+- HDR is tone-mapped to SDR; there is no HDR canvas output path yet. The mastering peak is taken
+  to be 1000 nits: static HDR10 metadata is not read and the peak is not measured per scene.
+- WebGL2 receives only 8 bits of an HDR frame the browser decoded, so fine gradients can band
+  there (deband helps); WebGPU gets the full depth. The Canvas 2D renderer shows such frames as
+  the browser converts them, about a stop darker than the other two.
 - FLV and AVI files whose video has B-frames do not start at position 0 on the FFmpeg routes:
   FFmpeg aims its seek a little before the target, these two demuxers fail a seek to before the
   start, and reading resumes at the second key frame. Opened or sought further in, they play.
