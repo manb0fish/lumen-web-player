@@ -119,3 +119,33 @@
   top: 30px;
   left: 10px;
 }
+
+.lp-root[data-skin='mpv'] .lp-osd-bar {
+  min-width: min(300px, 70cqw);
+}
+/* touch: mpv stays dense, but not smaller than a fingertip can hit */
+.lp-root[data-skin='mpv'][data-touch] {
+  --lp-touch-min: 34px;
+}
+.lp-root[data-skin='mpv'][data-touch] .lp-btn:hover {
+  background: transparent;
+  color: inherit;
+}
+.lp-root[data-skin='mpv'][data-touch] .lp-btn:active {
+  background: #e8e8e8;
+  color: #000;
+}
+/* compact: the seek bar gets a line of its own above the buttons */
+.lp-root[data-skin='mpv'][data-size='compact'] .lp-region-bottom .lp-row {
+  row-gap: 0;
+}
+.lp-root[data-skin='mpv'][data-size='compact'] .lp-region-bottom .lp-seekbar {
+  order: -1;
+  flex: 1 1 100%;
+}
+.lp-root[data-skin='mpv'][data-size='compact'] .lp-region-bottom .lp-time {
+  margin-right: auto;
+}
+.lp-root[data-skin='mpv'][data-size='compact'] .lp-status-line {
+  font-size: 11px;
+}

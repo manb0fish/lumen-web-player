@@ -32,6 +32,9 @@ Lo que puede hacer:
 - **Cambiar de aspecto.** Incluye tres temas, y puedes crear el tuyo con un pequeño archivo JSON.
 - **Manejarse con el teclado.** Los mismos atajos que mpv: avance fotograma a fotograma, control
   de velocidad, retardo de subtítulos, bucle A-B y más.
+- **Funcionar en móviles y tabletas.** Los controles se reorganizan solos en pantallas pequeñas y
+  responden al tacto: toca dos veces a la izquierda o a la derecha de la imagen para saltar
+  10 segundos.
 - **Enseñar lo que pasa por dentro.** Pulsa `i` para abrir un panel de estadísticas en directo.
 
 | Modern Glass | mpv OSC (con estadísticas) | Studio Deck |
@@ -191,7 +194,7 @@ Más información (en inglés):
   batería de pruebas.
 - [Arquitectura](../ARCHITECTURE.md): cómo funcionan la decodificación, el renderizado, la
   sincronización de audio y los subtítulos, y las decisiones de diseño que hay detrás.
-- [Verificación](../VERIFICATION.md): qué miden las 163 pruebas automatizadas y sus resultados.
+- [Verificación](../VERIFICATION.md): qué miden las 202 pruebas automatizadas y sus resultados.
 
 ## Autores
 

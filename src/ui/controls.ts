@@ -148,14 +148,16 @@ registerControl('play', (ctx, cfg) => {
 registerControl('big-play', (ctx, cfg) => {
   const b = button(ctx, {
     icon: 'play',
-    title: 'Play',
+    title: 'Play / Pause',
     className: `lp-big-play ${cfg.class ?? ''}`,
     onClick: () => ctx.player.togglePause(),
   });
   ctx.watch(['paused', 'ended', 'status'], (s) => {
-    const show = (s.paused || s.ended) && s.status !== 'idle' && s.status !== 'loading' && s.status !== 'error';
-    b.style.display = show ? '' : 'none';
-    const icon = s.ended ? 'replay' : 'play';
+    // Shown while paused. With touch input the stylesheet also shows it while playing (as a pause
+    // button), because a tap on the picture brings up the controls instead of pausing.
+    const ready = s.status !== 'idle' && s.status !== 'loading' && s.status !== 'error';
+    b.dataset.state = !ready ? 'off' : s.paused || s.ended ? 'paused' : 'playing';
+    const icon = s.ended ? 'replay' : s.paused ? 'play' : 'pause';
     if (b.dataset.icon !== icon) setButtonFace(ctx, b, icon);
   });
   return b;
@@ -252,7 +254,8 @@ registerControl('time', (ctx, cfg) => {
   let last = '';
   if (cfg.format) {
     ctx.frame(() => {
-      const text = template(cfg.format, { current: ctx.player.currentTime, duration: ctx.player.duration });
+      const format = (ctx.root.dataset.size === 'compact' && cfg.compactFormat) || cfg.format;
+      const text = template(format, { current: ctx.player.currentTime, duration: ctx.player.duration });
       if (text !== last) t.textContent = last = text;
     });
     return t;
@@ -398,6 +401,7 @@ registerControl('seekbar', (ctx, cfg) => {
     bar.setPointerCapture(e.pointerId);
     dragTime = timeAt(e.clientX);
     lastScrub = performance.now();
+    showTip(e.clientX);
     p.seek(dragTime, false);
     e.stopPropagation();
   });
@@ -502,22 +506,24 @@ function menuButton(
   });
 }
 
-registerControl('speed', (ctx, cfg) => {
-  const b = menuButton(ctx, cfg, { icon: 'speed', title: 'Playback speed', label: 'SPEED' }, () => {
-    const cur = ctx.player.store.state.speed;
-    const items: MenuItem[] = [{ type: 'header', label: 'Speed  ·  [ and ] to nudge' }];
-    for (const v of [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]) {
-      items.push({ label: `${v}×`, checked: Math.abs(cur - v) < 0.005, onSelect: () => run(ctx, `set speed ${v}`) });
-    }
-    items.push({ type: 'separator' });
-    items.push({
-      label: 'Preserve pitch',
-      checked: ctx.player.store.state.pitchCorrection,
-      keepOpen: true,
-      onSelect: () => run(ctx, 'cycle audio-pitch-correction'),
-    });
-    return items;
+function speedItems(ctx: ControlContext): MenuItem[] {
+  const cur = ctx.player.store.state.speed;
+  const items: MenuItem[] = [{ type: 'header', label: 'Speed  ·  [ and ] to nudge' }];
+  for (const v of [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 3, 4]) {
+    items.push({ label: `${v}×`, checked: Math.abs(cur - v) < 0.005, onSelect: () => run(ctx, `set speed ${v}`) });
+  }
+  items.push({ type: 'separator' });
+  items.push({
+    label: 'Preserve pitch',
+    checked: ctx.player.store.state.pitchCorrection,
+    keepOpen: true,
+    onSelect: () => run(ctx, 'cycle audio-pitch-correction'),
   });
+  return items;
+}
+
+registerControl('speed', (ctx, cfg) => {
+  const b = menuButton(ctx, cfg, { icon: 'speed', title: 'Playback speed', label: 'SPEED' }, () => speedItems(ctx));
   if (cfg.showValue) {
     ctx.watch(['speed'], (s) => setButtonFace(ctx, b, undefined, `${s.speed.toFixed(2)}×`));
   }
@@ -549,116 +555,163 @@ registerControl('subtitles', (ctx, cfg) => {
   return b;
 });
 
-registerControl('audio', (ctx, cfg) =>
-  menuButton(ctx, cfg, { icon: 'audio', title: 'Audio', label: 'AUDIO' }, () => {
-    const s = ctx.player.store.state;
-    const items: MenuItem[] = [{ type: 'header', label: 'Audio track' }];
-    const tracks = s.mediaInfo?.audioTracks ?? [];
-    if (!tracks.length) items.push({ label: 'No audio', checked: true });
-    for (const t of tracks) {
-      items.push({
-        label: `#${t.index + 1} ${t.name ?? t.language}`,
-        hint: `${t.codec} ${t.channels}ch`,
-        checked: t.index === s.audioTrack,
-        onSelect: () => run(ctx, `set aid ${t.index}`),
-      });
-    }
-    items.push({ type: 'separator' });
+function audioItems(ctx: ControlContext): MenuItem[] {
+  const s = ctx.player.store.state;
+  const items: MenuItem[] = [{ type: 'header', label: 'Audio track' }];
+  const tracks = s.mediaInfo?.audioTracks ?? [];
+  if (!tracks.length) items.push({ label: 'No audio', checked: true });
+  for (const t of tracks) {
     items.push({
-      label: 'Gain normalization',
-      hint: 'n',
-      checked: s.normalize,
-      keepOpen: true,
-      onSelect: () => run(ctx, 'cycle audio-normalize'),
+      label: `#${t.index + 1} ${t.name ?? t.language}`,
+      hint: `${t.codec} ${t.channels}ch`,
+      checked: t.index === s.audioTrack,
+      onSelect: () => run(ctx, `set aid ${t.index}`),
     });
+  }
+  items.push({ type: 'separator' });
+  items.push({
+    label: 'Gain normalization',
+    hint: 'n',
+    checked: s.normalize,
+    keepOpen: true,
+    onSelect: () => run(ctx, 'cycle audio-normalize'),
+  });
+  items.push({
+    label: 'Preserve pitch when changing speed',
+    checked: s.pitchCorrection,
+    keepOpen: true,
+    onSelect: () => run(ctx, 'cycle audio-pitch-correction'),
+  });
+  return items;
+}
+
+registerControl('audio', (ctx, cfg) => menuButton(ctx, cfg, { icon: 'audio', title: 'Audio', label: 'AUDIO' }, () => audioItems(ctx)));
+
+function videoItems(ctx: ControlContext): MenuItem[] {
+  const s = ctx.player.store.state;
+  const items: MenuItem[] = [{ type: 'header', label: 'Renderer  ·  r' }];
+  for (const r of ['webgpu', 'webgl2', 'canvas2d'] as const) {
     items.push({
-      label: 'Preserve pitch when changing speed',
-      checked: s.pitchCorrection,
-      keepOpen: true,
-      onSelect: () => run(ctx, 'cycle audio-pitch-correction'),
+      label: r === 'webgpu' ? 'WebGPU' : r === 'webgl2' ? 'WebGL 2' : 'Canvas 2D',
+      checked: s.renderer === r,
+      onSelect: () => run(ctx, `set renderer ${r}`),
     });
-    return items;
-  }),
-);
+  }
+  items.push({ type: 'header', label: 'Scaler  ·  u' });
+  for (const [v, label] of [
+    ['bilinear', 'Bilinear'],
+    ['bicubic', 'Bicubic (Catmull-Rom)'],
+    ['lanczos', 'Lanczos 3'],
+    ['fsr', 'FSR / EASU'],
+  ]) {
+    items.push({ label, checked: s.scaler === v, keepOpen: true, onSelect: () => run(ctx, `set scale ${v}`) });
+  }
+  items.push({ type: 'header', label: 'Post-processing' });
+  items.push({ label: 'Deband', hint: 'b', checked: s.deband, keepOpen: true, onSelect: () => run(ctx, 'cycle deband') });
+  items.push({
+    label: `Sharpen (RCAS): ${s.sharpen.toFixed(2)}`,
+    hint: 'Ctrl+s',
+    checked: s.sharpen > 0,
+    keepOpen: true,
+    onSelect: () => run(ctx, 'cycle-values sharpen 0 0.35 0.7 1'),
+  });
+  items.push({ label: 'Dither', checked: s.dither, keepOpen: true, onSelect: () => run(ctx, 'cycle dither') });
+  items.push({
+    label: 'Scale in linear light',
+    hint: 'g',
+    checked: s.linearScaling,
+    keepOpen: true,
+    onSelect: () => run(ctx, 'cycle linear-scaling'),
+  });
+  items.push({ type: 'header', label: 'HDR tone mapping  ·  t' });
+  for (const v of ['bt2390', 'hable', 'reinhard', 'clip']) {
+    items.push({
+      label: v === 'bt2390' ? 'BT.2390' : v[0].toUpperCase() + v.slice(1),
+      checked: s.toneMapping === v,
+      keepOpen: true,
+      onSelect: () => run(ctx, `set tone-mapping ${v}`),
+    });
+  }
+  items.push({ type: 'header', label: 'Wide gamut to display' });
+  for (const [v, label] of [
+    ['soft', 'Compress saturation (keeps hue)'],
+    ['clip', 'Clip'],
+  ]) {
+    items.push({
+      label,
+      checked: s.gamutMapping === v,
+      keepOpen: true,
+      onSelect: () => run(ctx, `set gamut-mapping ${v}`),
+    });
+  }
+  return items;
+}
 
 registerControl('video', (ctx, cfg) =>
-  menuButton(ctx, cfg, { icon: 'video', title: 'Video & shaders', label: 'VIDEO' }, () => {
-    const s = ctx.player.store.state;
-    const items: MenuItem[] = [{ type: 'header', label: 'Renderer  ·  r' }];
-    for (const r of ['webgpu', 'webgl2', 'canvas2d'] as const) {
-      items.push({
-        label: r === 'webgpu' ? 'WebGPU' : r === 'webgl2' ? 'WebGL 2' : 'Canvas 2D',
-        checked: s.renderer === r,
-        onSelect: () => run(ctx, `set renderer ${r}`),
-      });
-    }
-    items.push({ type: 'header', label: 'Scaler  ·  u' });
-    for (const [v, label] of [
-      ['bilinear', 'Bilinear'],
-      ['bicubic', 'Bicubic (Catmull-Rom)'],
-      ['lanczos', 'Lanczos 3'],
-      ['fsr', 'FSR / EASU'],
-    ]) {
-      items.push({ label, checked: s.scaler === v, keepOpen: true, onSelect: () => run(ctx, `set scale ${v}`) });
-    }
-    items.push({ type: 'header', label: 'Post-processing' });
-    items.push({ label: 'Deband', hint: 'b', checked: s.deband, keepOpen: true, onSelect: () => run(ctx, 'cycle deband') });
-    items.push({
-      label: `Sharpen (RCAS): ${s.sharpen.toFixed(2)}`,
-      hint: 'Ctrl+s',
-      checked: s.sharpen > 0,
-      keepOpen: true,
-      onSelect: () => run(ctx, 'cycle-values sharpen 0 0.35 0.7 1'),
-    });
-    items.push({ label: 'Dither', checked: s.dither, keepOpen: true, onSelect: () => run(ctx, 'cycle dither') });
-    items.push({
-      label: 'Scale in linear light',
-      hint: 'g',
-      checked: s.linearScaling,
-      keepOpen: true,
-      onSelect: () => run(ctx, 'cycle linear-scaling'),
-    });
-    items.push({ type: 'header', label: 'HDR tone mapping  ·  t' });
-    for (const v of ['bt2390', 'hable', 'reinhard', 'clip']) {
-      items.push({
-        label: v === 'bt2390' ? 'BT.2390' : v[0].toUpperCase() + v.slice(1),
-        checked: s.toneMapping === v,
-        keepOpen: true,
-        onSelect: () => run(ctx, `set tone-mapping ${v}`),
-      });
-    }
-    return items;
-  }),
+  menuButton(ctx, cfg, { icon: 'video', title: 'Video & shaders', label: 'VIDEO' }, () => videoItems(ctx)),
 );
+
+function tierItems(ctx: ControlContext): MenuItem[] {
+  const s = ctx.player.store.state;
+  const items: MenuItem[] = [{ type: 'header', label: `Decode tier  ·  now: ${s.mode ?? '—'}` }];
+  for (const [v, label, hint] of [
+    ['auto', 'Automatic', 'best available'],
+    ['webcodecs', 'WebCodecs', 'tier 1'],
+    ['mse', 'Media Source Extensions', 'tier 2'],
+    ['wasm', 'FFmpeg WebAssembly', 'tier 3'],
+  ]) {
+    items.push({ label, hint, checked: s.tierRequest === v, onSelect: () => run(ctx, `set tier ${v}`) });
+  }
+  return items;
+}
 
 registerControl('tier', (ctx, cfg) =>
-  menuButton(ctx, cfg, { icon: 'tier', title: 'Decode pipeline', label: 'TIER' }, () => {
-    const s = ctx.player.store.state;
-    const items: MenuItem[] = [{ type: 'header', label: `Decode tier  ·  now: ${s.mode ?? '—'}` }];
-    for (const [v, label, hint] of [
-      ['auto', 'Automatic', 'best available'],
-      ['webcodecs', 'WebCodecs', 'tier 1'],
-      ['mse', 'Media Source Extensions', 'tier 2'],
-      ['wasm', 'FFmpeg WebAssembly', 'tier 3'],
-    ]) {
-      items.push({ label, hint, checked: s.tierRequest === v, onSelect: () => run(ctx, `set tier ${v}`) });
-    }
-    return items;
-  }),
+  menuButton(ctx, cfg, { icon: 'tier', title: 'Decode pipeline', label: 'TIER' }, () => tierItems(ctx)),
 );
 
-registerControl('skins', (ctx, cfg) =>
-  menuButton(ctx, cfg, { icon: 'skin', title: 'Skins', label: 'SKIN' }, () => {
-    const items: MenuItem[] = [{ type: 'header', label: 'Skin  ·  K' }];
-    for (const sk of ctx.ui.skins()) {
-      items.push({ label: sk.name, checked: sk.id === ctx.skin.id, onSelect: () => ctx.ui.setSkin(sk.id) });
-    }
-    items.push({ type: 'separator' });
-    items.push({ label: 'Skin inspector…', onSelect: () => ctx.ui.toggleInspector('skin') });
-    items.push({ label: 'Key bindings…', onSelect: () => ctx.ui.toggleInspector('keys') });
-    return items;
-  }),
-);
+function skinItems(ctx: ControlContext): MenuItem[] {
+  const items: MenuItem[] = [{ type: 'header', label: 'Skin  ·  K' }];
+  for (const sk of ctx.ui.skins()) {
+    items.push({ label: sk.name, checked: sk.id === ctx.skin.id, onSelect: () => ctx.ui.setSkin(sk.id) });
+  }
+  items.push({ type: 'separator' });
+  items.push({ label: 'Skin inspector…', onSelect: () => ctx.ui.toggleInspector('skin') });
+  items.push({ label: 'Key bindings…', onSelect: () => ctx.ui.toggleInspector('keys') });
+  return items;
+}
+
+registerControl('skins', (ctx, cfg) => menuButton(ctx, cfg, { icon: 'skin', title: 'Skins', label: 'SKIN' }, () => skinItems(ctx)));
+
+/**
+ * Overflow menu: everything a compact layout has no room for, one tap away. Only shown while the
+ * player is in its compact layout, unless the skin passes { "always": true }.
+ */
+registerControl('more', (ctx, cfg) => {
+  const b = menuButton(ctx, cfg, { icon: 'more', title: 'More', label: 'MORE' }, () => {
+    const s = ctx.player.store.state;
+    return [
+      { type: 'header', label: 'More' },
+      { label: 'Playback speed', hint: `${s.speed.toFixed(2)}×  ›`, submenu: () => speedItems(ctx) },
+      { label: 'Audio', submenu: () => audioItems(ctx) },
+      { label: 'Video & shaders', submenu: () => videoItems(ctx) },
+      { label: 'Decode pipeline', hint: `${s.tier ?? '—'}  ›`, submenu: () => tierItems(ctx) },
+      { label: 'Skins', submenu: () => skinItems(ctx) },
+      { type: 'separator' },
+      { label: 'Muted', checked: s.muted, keepOpen: true, onSelect: () => run(ctx, 'cycle mute') },
+      { label: `Volume −   (${Math.round(s.volume)}%)`, keepOpen: true, onSelect: () => run(ctx, 'add volume -10') },
+      { label: 'Volume +', keepOpen: true, onSelect: () => run(ctx, 'add volume 10') },
+      { label: 'Previous frame', hint: ',', keepOpen: true, onSelect: () => run(ctx, 'frame-back-step') },
+      { label: 'Next frame', hint: '.', keepOpen: true, onSelect: () => run(ctx, 'frame-step') },
+      { label: 'Loop file', checked: s.loop, keepOpen: true, onSelect: () => run(ctx, 'cycle loop-file') },
+      { type: 'separator' },
+      { label: 'Stats for nerds', checked: s.stats, onSelect: () => run(ctx, 'cycle stats') },
+      { label: 'Screenshot', onSelect: () => run(ctx, 'screenshot') },
+      { label: 'Open file…', onSelect: () => ctx.ui.openFile() },
+    ] satisfies MenuItem[];
+  });
+  if (!cfg.always) b.classList.add('lp-show-narrow');
+  return b;
+});
 
 // ---- meters ------------------------------------------------------------------------------------
 

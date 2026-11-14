@@ -203,3 +203,62 @@
   text-shadow: 0 0 6px rgba(255, 176, 0, 0.6);
   box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.9);
 }
+
+/* compact: transport and timecode on one line, seek bar on the next, menus on a third */
+.lp-root[data-skin='studio'][data-size='compact'] .lp-region-bottom {
+  padding: 8px 10px;
+  gap: 6px;
+}
+.lp-root[data-skin='studio'][data-size='compact'] .lp-deck-meter,
+.lp-root[data-skin='studio'][data-size='compact'] .lp-deck-level,
+.lp-root[data-skin='studio'][data-size='compact'] [data-control='stop'],
+.lp-root[data-skin='studio'][data-size='compact'] [data-control='loop'],
+.lp-root[data-skin='studio'][data-size='compact'] [data-control='abloop'] {
+  display: none;
+}
+.lp-root[data-skin='studio'][data-size='compact'] .lp-spacer,
+.lp-root[data-skin='studio'][data-size='compact'] .lp-lcd-cell:nth-child(2) {
+  display: none;
+}
+.lp-root[data-skin='studio'][data-size='compact'] .lp-lcd {
+  min-width: 0;
+  flex: 1 1 0;
+  overflow: hidden;
+}
+.lp-root[data-skin='studio'][data-size='compact'] .lp-region-bottom .lp-seekbar {
+  /* fills its line together with the two time readouts, so the buttons start a new one */
+  flex: 1 1 calc(100% - 150px);
+}
+.lp-root[data-skin='studio'][data-size='compact'] [data-control='fullscreen'] {
+  margin-left: auto;
+}
+/* short (a phone held sideways): the whole deck on a single line */
+.lp-root[data-skin='studio'][data-short] .lp-region-bottom {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  padding: 6px 10px;
+}
+.lp-root[data-skin='studio'][data-short] .lp-region-bottom .lp-row {
+  display: contents;
+}
+.lp-root[data-skin='studio'][data-short] .lp-lcd,
+.lp-root[data-skin='studio'][data-short] .lp-deck-meter,
+.lp-root[data-skin='studio'][data-short] .lp-deck-toggles,
+.lp-root[data-skin='studio'][data-short] .lp-deck-level,
+.lp-root[data-skin='studio'][data-short] .lp-spacer,
+.lp-root[data-skin='studio'][data-short] .lp-hide-narrow,
+.lp-root[data-skin='studio'][data-short] [data-control='stop'],
+.lp-root[data-skin='studio'][data-short] [data-control='loop'],
+.lp-root[data-skin='studio'][data-short] [data-control='abloop'] {
+  display: none !important;
+}
+.lp-root[data-skin='studio'][data-short] .lp-show-narrow {
+  display: inline-flex !important;
+}
+.lp-root[data-skin='studio'][data-short] .lp-region-bottom .lp-seekbar {
+  flex: 1 1 120px;
+}
+.lp-root[data-skin='studio'][data-short] [data-control='fullscreen'] {
+  margin-left: 0;
+}

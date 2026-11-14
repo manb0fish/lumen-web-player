@@ -18,6 +18,7 @@
  *     for short, self-terminating segments (`-ss T -t D`) and paces them itself.
  */
 import type { AudioTrackInfo, ColorInfo, MediaInfo, VideoTrackInfo } from '../core/types';
+import { BlockCache, IO_BLOCK, createReader, probeUrl, syncFill, waitForBlock, type ReadFn } from './ffmpeg-io';
 import { CTRL_CLOCK_MS, CTRL_GEN, CTRL_MSE_GATE, CTRL_RELEASED } from './ffmpeg-shared';
 
 const post = (msg: any, transfer: Transferable[] = []) => (self as any).postMessage(msg, transfer);
@@ -32,6 +33,16 @@ let FS: any = null;
 let ctrl: Int32Array | null = null;
 let audioPort: MessagePort | null = null;
 let inputPath = '';
+let inputSize = 0;
+let ioWorker: Worker | null = null;
+/**
+ * Posted read-ahead only (no SharedArrayBuffer): resolve once the given byte range has arrived
+ * from the read-ahead worker, or after a short while. Called between two exec() calls, where
+ * waiting costs nothing; inside exec() missing data has to be fetched synchronously.
+ */
+let awaitInput: ((from: number, bytes: number) => Promise<void>) | null = null;
+/** Posted read-ahead only: stop / restart the background download. */
+let pauseReadAhead: ((on: boolean) => void) | null = null;
 let multiThread = false;
 let logTail: string[] = [];
 let capture: string[] | null = null;
@@ -293,13 +304,139 @@ async function init(m: any): Promise<void> {
   post({ type: 'ready', id: m.id, wasmModule: m.wasmModule ? undefined : compiled, multiThread });
 }
 
+/**
+ * Start the read-ahead worker and wait until it is listening. With a SharedArrayBuffer it fills
+ * the cache directly; without one it posts blocks, which `onBlock` receives between exec() calls.
+ */
+function startIoWorker(
+  src: { blob?: Blob; url?: string; size: number },
+  sab: SharedArrayBuffer | null,
+  onBlock?: (index: number, data: ArrayBuffer) => void,
+): Promise<Worker> {
+  return new Promise((resolve, reject) => {
+    const w = new Worker(new URL('./io-worker.ts', import.meta.url), { type: 'module', name: 'lumen-io' });
+    const timer = setTimeout(() => {
+      w.terminate();
+      reject(new Error('the I/O worker did not start'));
+    }, 8000);
+    w.onmessage = (e) => {
+      if (e.data?.type === 'ready') {
+        clearTimeout(timer);
+        resolve(w);
+      } else if (e.data?.type === 'block') onBlock?.(e.data.index, e.data.data);
+      else if (e.data?.type === 'error') onLog(`input: ${e.data.message}`);
+    };
+    w.onerror = (e) => {
+      clearTimeout(timer);
+      e.preventDefault?.();
+      w.terminate();
+      reject(new Error(e.message || 'the I/O worker failed to load'));
+    };
+    w.postMessage({ type: 'open', sab, block: IO_BLOCK, blob: src.blob, url: src.url, size: src.size });
+  });
+}
+
+/**
+ * Make the source available to FFmpeg as /in/input.<ext>. Nothing is downloaded up front: reads
+ * go through a block cache that is filled on demand (see ffmpeg-io.ts), ahead of the reader by a
+ * separate worker when SharedArrayBuffer is available.
+ */
 async function openInput(m: any): Promise<void> {
-  let blob: Blob = m.blob;
-  if (!blob && m.url) {
-    const res = await fetch(m.url);
-    if (!res.ok) throw new Error(`HTTP ${res.status} while fetching the source`);
-    blob = await res.blob();
+  ioWorker?.terminate();
+  ioWorker = null;
+  awaitInput = null;
+  pauseReadAhead = null;
+  let blob: Blob | undefined = m.blob;
+  let url: string | undefined;
+  let size = 0;
+  let io = '';
+  if (blob) size = blob.size;
+  else if (m.url) {
+    const probed = await probeUrl(m.url);
+    size = probed.size;
+    if (probed.blob) {
+      blob = probed.blob;
+      io = 'downloaded in full (no HTTP range support)';
+    } else url = m.url;
+  } else throw new Error('no source to open');
+  const src = { blob, url, size };
+
+  let read: ReadFn | null = null;
+  if (ctrl && typeof SharedArrayBuffer !== 'undefined') {
+    try {
+      const cache = new BlockCache(new SharedArrayBuffer(BlockCache.bytes()));
+      ioWorker = await startIoWorker(src, cache.buffer as SharedArrayBuffer);
+      // During a probe there is no job, and nothing to abort.
+      read = createReader(
+        cache,
+        size,
+        waitForBlock(cache, () => job !== null && shouldAbort()),
+      );
+      io ||= url ? 'HTTP range requests, read ahead by a worker' : 'read ahead by a worker';
+    } catch (err: any) {
+      onLog(`input: read-ahead unavailable (${err?.message ?? err}), reading synchronously`);
+      ioWorker = null;
+    }
   }
+  if (!read) {
+    // No shared memory. A worker still downloads ahead in the background and posts the blocks; they
+    // arrive between exec() calls, so each segment finds its data waiting. Whatever is not there
+    // yet is fetched synchronously, in small pieces.
+    // The worker cannot see this cache, so it is told exactly what changes in it: which blocks were
+    // evicted, and which ones the reader fetched for itself.
+    const cache = new BlockCache(new ArrayBuffer(BlockCache.bytes()));
+    let at = 0;
+    let worker: Worker | null = null;
+    let gone: number[] = [];
+    cache.onEvict = (b) => gone.push(b);
+    const report = () => {
+      worker?.postMessage({ type: 'at', block: at, gone });
+      gone = [];
+    };
+    try {
+      worker = await startIoWorker(src, null, (index, data) => {
+        if (cache.find(index) >= 0) return;
+        cache.makeRoom(at, 2);
+        const slot = cache.claim();
+        if (slot < 0) {
+          gone.push(index); // no room: the worker must not count on it being here
+          report();
+          return;
+        }
+        cache.data.set(new Uint8Array(data), slot * cache.block);
+        cache.publish(slot, index, data.byteLength);
+        if (gone.length) report();
+      });
+    } catch (err: any) {
+      onLog(`input: read-ahead unavailable (${err?.message ?? err})`);
+    }
+    ioWorker = worker;
+    if (worker) {
+      const w = worker;
+      const lastBlock = Math.max(0, Math.ceil(size / cache.block) - 1);
+      awaitInput = async (from, bytes) => {
+        const first = Math.min(lastBlock, Math.max(0, Math.floor(from / cache.block)));
+        const last = Math.min(lastBlock, Math.floor((from + bytes) / cache.block));
+        at = first;
+        report(); // move the read-ahead window there
+        const deadline = performance.now() + 2500;
+        for (;;) {
+          let b = first;
+          while (b <= last && cache.find(b) >= 0) b++;
+          if (b > last || performance.now() > deadline) return;
+          await new Promise((r) => setTimeout(r, 15));
+        }
+      };
+      pauseReadAhead = (on) => w.postMessage({ type: 'pause', on });
+    }
+    const fill = syncFill(cache, src, worker ? 4 : 16, (first, count) => worker?.postMessage({ type: 'have', first, count }));
+    read = createReader(cache, size, fill, (b) => {
+      at = b;
+      report();
+    });
+    io ||= `${url ? 'HTTP range requests' : 'block reads'}, ${worker ? 'read ahead between segments' : 'synchronous'}`;
+  }
+
   try {
     FS.unmount('/in');
   } catch {
@@ -307,9 +444,21 @@ async function openInput(m: any): Promise<void> {
   }
   const ext = (m.ext || 'bin').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'bin';
   const name = `input.${ext}`;
-  FS.mount(FS.filesystems.WORKERFS, { blobs: [{ name, data: blob }] }, '/in');
+  // WORKERFS provides a read-only file of the right size (stat, seek); only its read is replaced.
+  FS.mount(FS.filesystems.WORKERFS, { blobs: [{ name, data: { size, lastModifiedDate: new Date() } }] }, '/in');
   inputPath = `/in/${name}`;
-  post({ type: 'opened', id: m.id, size: blob.size });
+  inputSize = size;
+  const node = FS.lookupPath(inputPath).node;
+  const readInput = read;
+  node.stream_ops = {
+    ...node.stream_ops,
+    read(_stream: any, buffer: Uint8Array, offset: number, length: number, position: number) {
+      const n = readInput(buffer, offset, length, position);
+      if (n < 0) throw new FS.ErrnoError(EIO);
+      return n;
+    },
+  };
+  post({ type: 'opened', id: m.id, size, io });
 }
 
 // ---- probing -----------------------------------------------------------------------------------
@@ -663,7 +812,12 @@ function remux(m: any): void {
     '-f',
     'mp4',
     '-movflags',
-    '+frag_keyframe+empty_moov+default_base_moof+frag_discont',
+    // negative_cts_offsets: with the timestamp shift disabled the muxer keeps its edit-list mode,
+    // in which a fragment's base time is the *presentation* time of its first packet and the
+    // decode-to-presentation delay is meant to be taken back out by an edit list. An empty moov
+    // has none, so every picture of a stream with B-frames landed that delay too late (two frames
+    // for typical H.264). Signed composition offsets make base time + offset the real PTS.
+    '+frag_keyframe+empty_moov+default_base_moof+frag_discont+negative_cts_offsets',
     '-frag_duration',
     '500000',
     '/dev/lumen_m',
@@ -702,10 +856,31 @@ self.onmessage = (e: MessageEvent) => {
         audioPort = m.port;
         break;
       case 'decode':
-        decode(m);
+        if (awaitInput && m.duration && m.total > 0) {
+          // A slice in posted mode: let the read-ahead worker bring its data in first (estimated
+          // from the position in the file, with a margin), so the slice itself decodes without
+          // stopping to fetch. The file header, re-read by every slice, is cached after the first.
+          const perSecond = inputSize / m.total;
+          const from = Math.max(0, m.time * perSecond - 512 * 1024);
+          const bytes = (m.duration + (m.preroll ?? 0)) * perSecond * 1.3 + 1024 * 1024;
+          awaitInput(from, bytes).then(() => {
+            try {
+              decode(m);
+            } catch (err) {
+              fail(err);
+            }
+          });
+        } else decode(m);
         break;
       case 'remux':
-        remux(m);
+        // A remux reads the whole file inside one exec(), where posted blocks cannot be seen: the
+        // background download would only take bandwidth from the reads that matter.
+        pauseReadAhead?.(true);
+        try {
+          remux(m);
+        } finally {
+          pauseReadAhead?.(false);
+        }
         break;
     }
   } catch (err) {

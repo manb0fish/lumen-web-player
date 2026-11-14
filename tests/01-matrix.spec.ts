@@ -21,7 +21,7 @@ import {
  * a route that makes sense for what the browser can and cannot decode.
  */
 
-const videos = manifest.files.filter((f) => f.video && !f.long && !f.colors);
+const videos = manifest.files.filter((f) => f.video && !f.long && !f.colors && !f.perf);
 const audios = manifest.files.filter((f) => !f.video);
 
 function expectedRoute(f: MediaFile, mode: string, tier: string): void {

@@ -16,6 +16,11 @@ export interface FrameSource {
    *  'next'       - the first frame with pts >= T.
    */
   readonly seekSemantics: 'containing' | 'next';
+  /**
+   * True when audio and video come out of one decoder in file order and share its back-pressure:
+   * the source stops delivering audio while the picture queue is full (see FramePipeline).
+   */
+  readonly coupled?: boolean;
   onFrame: (frame: MediaFrame, gen: number) => void;
   onEos: (kind: 'video' | 'audio', gen: number) => void;
   /** Reports where playback really starts (key-frame time for inexact seeks). Needs `go()` to proceed. */
@@ -110,10 +115,14 @@ export class FfmpegSource implements FrameSource {
     this.frameDur = 1 / (v?.fps || 30);
     // No key-frame index in these: FFmpeg's seek can land past the target, losing the frames in between.
     if (/mpegts|mpeg|m2ts|h264|hevc|flv|asf|rm|ogg|nut/i.test(info.container)) this.preroll = 3;
-    // Without SAB each exec() covers a bounded slice; size it by a pixel budget (~96 MB of frames).
+    // Without SAB each exec() covers a bounded slice, and everything it decodes arrives at once.
+    // Longer slices waste less: a slice that starts inside a GOP has to decode from the previous
+    // key frame again. So take as many frames as memory reasonably allows (two slices can be in
+    // memory at a time): ~192 MB of frames on machines with 8 GB or more, ~96 MB otherwise.
     if (v) {
       const bytes = v.width * v.height * 1.5 * (v.bitDepth > 8 ? 2 : 1);
-      const frames = Math.max(8, Math.min(48, Math.floor(96e6 / bytes)));
+      const budget = ((navigator as { deviceMemory?: number }).deviceMemory ?? 4) >= 8 ? 192e6 : 96e6;
+      const frames = Math.max(8, Math.min(96, Math.floor(budget / bytes)));
       this.segLen = Math.max(0.25, frames / (v.fps || 30));
     } else {
       this.segLen = 4;
@@ -149,6 +158,10 @@ export class FfmpegSource implements FrameSource {
     client.onFailed = (message) => this.onError(message, 'ffmpeg');
   }
 
+  get coupled(): boolean {
+    return this.provides.video && this.provides.audio && this.client.shared;
+  }
+
   private request(): void {
     if (this.busy || this.eof) return;
     const v = this.info.video;
@@ -163,6 +176,7 @@ export class FfmpegSource implements FrameSource {
       preroll: pre,
       basePts: ffTime - this.timeOffset,
       duration: shared ? undefined : this.segLen,
+      total: this.info.duration,
       maxQueue: this.maxQueue,
       threads: Math.min(8, Math.max(2, (navigator.hardwareConcurrency || 4) - 1)),
       eosAtEnd: shared,

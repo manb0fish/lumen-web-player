@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { expectNoErrors, load, openApp, readFrame, state, stats, trackErrors, waitForTime } from './helpers';
+import { expectNoErrors, load, openApp, readFrame, seekPaused, state, stats, trackErrors, waitForTime } from './helpers';
 
 /**
  * Forced decoder routing: WebCodecs -> MSE -> FFmpeg WASM.
@@ -69,17 +69,17 @@ const cases: Array<{ name: string; file: string; params: Record<string, string>;
     mode: 'wasm-sw',
   },
   {
-    name: 'Tier 3 FFmpeg WASM pthread core (multi-threaded software decode, 10-bit HEVC)',
+    name: 'Tier 3 FFmpeg WASM pthread core is the default (multi-threaded software decode, 10-bit HEVC)',
     file: 'hevc10_aac.mkv',
-    params: { tier: 'wasm', threads: '1' },
+    params: { tier: 'wasm' },
     tier: 'wasm',
     mode: 'wasm-sw',
     note: 'FFmpeg core ready (pthreads',
   },
   {
-    name: 'Tier 3 FFmpeg WASM single-thread core is the default',
+    name: 'Tier 3 FFmpeg WASM single-thread core on request',
     file: 'h264_opus.mkv',
-    params: { tier: 'wasm' },
+    params: { tier: 'wasm', threads: '0' },
     tier: 'wasm',
     mode: 'wasm-sw',
     note: 'FFmpeg core ready (single-thread, SharedArrayBuffer flow control)',
@@ -168,6 +168,70 @@ for (const c of cases) {
     }
     if (c.note) expect(st.notes.join('\n')).toContain(c.note);
     test.info().annotations.push({ type: 'stall', description: `${r.maxStallMs.toFixed(0)} ms max` });
+    expectNoErrors(errors);
+  });
+}
+
+/**
+ * Stream copy has to leave every picture at its own presentation time, also in a stream that
+ * begins in the middle of the file, which is what a seek outside the buffer starts. The MP4 clip
+ * has B-frames: there the fMP4 muxer used to place pictures later by the decode-to-presentation
+ * delay (two frames). The FLV clip guards the start-time handling that shares the same flags.
+ */
+const remuxSeeks: Array<{
+  name: string;
+  file: string;
+  params: Record<string, string>;
+  /** Open the file at this position, so that even the first stream begins mid-file. */
+  start?: number;
+  /** Presentation time of the first picture on the player timeline. */
+  origin: number;
+  seeks: number[];
+}> = [
+  {
+    name: 'MP4 with B-frames',
+    file: 'h264_aac_long.mp4',
+    params: { tier: 'wasm', wasm: 'remux' },
+    origin: 0,
+    // On frame boundaries and between them; 20.02 lies inside what the seek to 12.5 buffered,
+    // the others each start a new stream at the key frame before them.
+    seeks: [33.4, 12.5, 20.02, 2.0, 47.77],
+  },
+  {
+    name: 'FLV',
+    file: 'h264_aac.flv',
+    params: {},
+    start: 5.3732,
+    // FLV stamps whole milliseconds, and this clip's audio leads its first picture by one AAC
+    // frame (1024 samples at 44.1 kHz); the timeline starts with the audio.
+    origin: 0.023,
+    seeks: [5.3732, 2.04, 7.005, 0.3732],
+  },
+];
+
+for (const c of remuxSeeks) {
+  test(`Tier 3 FFmpeg WASM stream-copy remux -> MSE shows the exact frame after seeks (${c.name})`, async ({ page }) => {
+    const errors = await openApp(page, c.params);
+    await load(page, c.file, c.start ? { startTime: c.start } : {});
+    expect((await state(page)).mode).toBe('wasm-remux-mse');
+    const fps = 30;
+    for (const [i, t] of c.seeks.entries()) {
+      await seekPaused(page, t);
+      const r = await readFrame(page);
+      expect(r.contrast, `frame counter readable at ${t} s`).toBeGreaterThan(80);
+      expect(r.frame, `picture on screen at ${t} s (reported PTS ${r.pts.toFixed(4)})`).toBe(Math.floor((t - c.origin) * fps + 1e-6));
+      expect(Math.abs(r.pts - (c.origin + r.frame / fps)), `reported PTS matches the picture at ${t} s`).toBeLessThan(0.002);
+      if (i === 0) {
+        // The stream this picture came from began at the key frame before the target, not at 0.
+        const from = await page.evaluate(() => {
+          const b = document.querySelector<HTMLVideoElement>('video.lp-native-video')!.buffered;
+          return b.length ? b.start(0) : -1;
+        });
+        expect(from, 'start of the buffered stream').toBeGreaterThan(t - 3);
+        expect(from).toBeLessThanOrEqual(t);
+      }
+    }
+    expect((await state(page)).error).toBeNull();
     expectNoErrors(errors);
   });
 }

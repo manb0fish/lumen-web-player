@@ -7,7 +7,8 @@ import { destroyPlayer, expectNoErrors, load, openApp, openHarness, readFrame, s
  * for is on screen) and must have released everything it took: VideoFrames, GPU textures, heap.
  */
 
-const TIERS = ['webcodecs', 'mse', 'wasm', 'wasm+threads'] as const;
+// 'wasm' runs the multi-threaded FFmpeg core (the default), 'wasm-1thread' the single-threaded one.
+const TIERS = ['webcodecs', 'mse', 'wasm', 'wasm-1thread'] as const;
 
 async function hammer(page: Page, seeks: number): Promise<{ maxAlive: number; maxQueue: number }> {
   return page.evaluate(async (n) => {
@@ -40,7 +41,7 @@ async function hammer(page: Page, seeks: number): Promise<{ maxAlive: number; ma
 
 for (const tier of TIERS) {
   test(`${tier}: survives 45 rapid seeks with speed changes, then lands on the exact frame`, async ({ page }) => {
-    const errors = await openApp(page, tier === 'wasm+threads' ? { tier: 'wasm', threads: 1 } : { tier });
+    const errors = await openApp(page, tier === 'wasm-1thread' ? { tier: 'wasm', threads: 0 } : { tier });
     await load(page, 'h264_aac_long.mp4', { autoplay: true });
     await waitForTime(page, 0.4);
     const h = await hammer(page, 45);

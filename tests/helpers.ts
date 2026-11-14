@@ -22,6 +22,8 @@ export interface MediaFile {
   colors?: boolean;
   hdr?: string;
   long?: boolean;
+  /** 1080p benchmark clip: not part of the playback matrix. */
+  perf?: boolean;
   subtitles?: string[];
   channels?: number;
   matrix?: string;

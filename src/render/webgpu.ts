@@ -1,7 +1,20 @@
 import type { MediaFrame, PlanarFrame, RenderSettings } from '../core/types';
-import { describeChain, frameDisplaySize, kernelCode, primariesCode, rotationCode, toneMapCode, transferCode, yuvUniforms } from './color';
+import {
+  describeChain,
+  type ExternalPacking,
+  frameDisplaySize,
+  gamutMapCode,
+  kernelCode,
+  packingCode,
+  primariesCode,
+  rotationCode,
+  toneMapCode,
+  transferCode,
+  yuvUniforms,
+} from './color';
+import { classifyExternal, ExternalHdrTracker, halfToFloat, PROBE_SIZE, PROBE_TILE, probeOrigins, sampleBrowserSdr } from './external-hdr';
 import { copyCanvas, countTexture, makeCanvas, newStats, type Renderer, type RendererStats } from './renderer';
-import { WGSL_DEBAND, WGSL_EASU, WGSL_FINAL, WGSL_INGEST_EXTERNAL, WGSL_INGEST_PLANAR, WGSL_SCALE } from './wgsl';
+import { WGSL_DEBAND, WGSL_EASU, WGSL_FINAL, WGSL_INGEST_EXTERNAL, WGSL_INGEST_PLANAR, WGSL_PROBE_EXTERNAL, WGSL_SCALE } from './wgsl';
 
 interface Target {
   tex: GPUTexture;
@@ -22,7 +35,9 @@ const INTERMEDIATE: GPUTextureFormat = 'rgba16float';
 
 /**
  * WebGPU renderer.
- *  - VideoFrame / <video> sources are imported zero-copy with importExternalTexture.
+ *  - VideoFrame / <video> sources are imported zero-copy with importExternalTexture. SDR arrives
+ *    converted by the browser; HDR arrives as coded samples, which the ingest shader unpacks and
+ *    colour-manages itself (external-hdr.ts explains, and checks, what was handed over).
  *  - Software-decoded pictures are uploaded as three planes (R8 for 8-bit, RG8-packed LE16 for
  *    10/12-bit) and converted by our own shader: range, matrix, PQ/HLG EOTF, tone map, gamut.
  *  - Optional deband, bicubic / Lanczos-3 / EASU scaling, RCAS sharpening and dithering.
@@ -44,6 +59,12 @@ export class WebGPURenderer implements Renderer {
   private pScale!: GPURenderPipeline;
   private pEasu!: GPURenderPipeline;
   private pFinal!: GPURenderPipeline;
+  private pProbe!: GPURenderPipeline;
+  private uProbe!: GPUBuffer;
+  private probeTex: GPUTexture | null = null;
+  private probeBuf: GPUBuffer | null = null;
+  private extHdr = new ExternalHdrTracker('webgpu');
+  private probeTimer = 0;
   private uExt!: GPUBuffer;
   private uPlanar!: GPUBuffer;
   private uDeband!: GPUBuffer;
@@ -72,13 +93,14 @@ export class WebGPURenderer implements Renderer {
     this.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
     device.pushErrorScope('validation');
-    const [pExt, pPlanar, pDeband, pScale, pEasu, pFinal] = await Promise.all([
+    const [pExt, pPlanar, pDeband, pScale, pEasu, pFinal, pProbe] = await Promise.all([
       this.pipeline('ingest-external', WGSL_INGEST_EXTERNAL, INTERMEDIATE),
       this.pipeline('ingest-planar', WGSL_INGEST_PLANAR, INTERMEDIATE),
       this.pipeline('deband', WGSL_DEBAND, INTERMEDIATE),
       this.pipeline('scale', WGSL_SCALE, INTERMEDIATE),
       this.pipeline('easu', WGSL_EASU, INTERMEDIATE),
       this.pipeline('final', WGSL_FINAL, this.format),
+      this.pipeline('probe-external', WGSL_PROBE_EXTERNAL, INTERMEDIATE),
     ]);
     const err = await device.popErrorScope();
     if (err) throw new Error(`WebGPU pipeline validation failed: ${err.message}`);
@@ -88,9 +110,11 @@ export class WebGPURenderer implements Renderer {
     this.pScale = pScale;
     this.pEasu = pEasu;
     this.pFinal = pFinal;
+    this.pProbe = pProbe;
 
     const ubuf = (size: number) => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.uExt = ubuf(16);
+    this.uExt = ubuf(48);
+    this.uProbe = ubuf(48);
     this.uPlanar = ubuf(112);
     this.uDeband = ubuf(16);
     this.uScale = ubuf(32);
@@ -222,6 +246,8 @@ export class WebGPURenderer implements Renderer {
 
     const A = this.target('A', disp.width, disp.height);
     const encoder = device.createCommandEncoder();
+    let packing: ExternalPacking = 'converted';
+    let afterSubmit: (() => void) | null = null;
 
     // ---- pass 1: ingest -> A -------------------------------------------------------------
     if (frame.kind === 'planar') {
@@ -233,7 +259,7 @@ export class WebGPURenderer implements Renderer {
       f.set([m[0], m[1], m[2], 0, m[3], m[4], m[5], 0, m[6], m[7], m[8], 0], 0);
       f.set([yuv.offset[0], yuv.offset[1], yuv.offset[2], 0], 12);
       f.set([yuv.scale[0], yuv.scale[1], yuv.scale[2], 0], 16);
-      f.set([yuv.pack[0], yuv.pack[1], settings.hdrPeak, 0], 20);
+      f.set([yuv.pack[0], yuv.pack[1], settings.hdrPeak, gamutMapCode(settings.gamutMapping)], 20);
       new Uint32Array(buf, 96, 4).set([transferCode(frame.color), primariesCode(frame.color), toneMapCode(settings.toneMapping), rot]);
       device.queue.writeBuffer(this.uPlanar, 0, buf);
       const bind = device.createBindGroup({
@@ -248,13 +274,25 @@ export class WebGPURenderer implements Renderer {
       });
       this.pass(encoder, this.pPlanar, bind, A.view);
     } else {
+      const source = frame.kind === 'videoframe' ? frame.frame : frame.el;
       let ext: GPUExternalTexture;
       try {
-        ext = device.importExternalTexture({ source: frame.kind === 'videoframe' ? frame.frame : frame.el });
+        ext = device.importExternalTexture({ source });
       } catch {
         return; // source not ready (e.g. <video> without a decoded frame yet)
       }
-      device.queue.writeBuffer(this.uExt, 0, new Uint32Array([0, 0, 0, rot]));
+      packing = settings.externalHdr ? this.extHdr.packingFor(frame) : 'converted';
+      const buf = new ArrayBuffer(48);
+      new Uint32Array(buf, 0, 8).set([
+        packingCode(packing),
+        transferCode(frame.color),
+        primariesCode(frame.color),
+        rot,
+        toneMapCode(settings.toneMapping),
+        gamutMapCode(settings.gamutMapping),
+      ]);
+      new Float32Array(buf, 32, 4).set([settings.hdrPeak]);
+      device.queue.writeBuffer(this.uExt, 0, buf);
       const bind = device.createBindGroup({
         layout: this.pExt.getBindGroupLayout(0),
         entries: [
@@ -264,6 +302,7 @@ export class WebGPURenderer implements Renderer {
         ],
       });
       this.pass(encoder, this.pExt, bind, A.view);
+      if (settings.externalHdr && this.extHdr.wantsProbe(frame, t0)) afterSubmit = this.probe(encoder, ext, source, frame, t0);
     }
     let cur: Target = A;
 
@@ -301,11 +340,98 @@ export class WebGPURenderer implements Renderer {
     }
     this.pass(encoder, this.pFinal, this.texBind(this.pFinal, this.uFinal, cur.view), view);
     device.queue.submit([encoder.finish()]);
+    afterSubmit?.();
 
     this.last = { frame, settings };
     this.stats.framesRendered++;
     this.stats.lastRenderMs = performance.now() - t0;
-    this.stats.chain = describeChain(frame, settings, outW, outH);
+    this.stats.chain = describeChain(frame, settings, outW, outH, packing);
+    if (frame.kind !== 'planar' && packing !== 'converted') this.stats.hdrHandover = this.extHdr.detail;
+    this.probeLater(frame, settings);
+  }
+
+  /** A paused player draws nothing new: come back by ourselves while a frame is still unchecked. */
+  private probeLater(frame: MediaFrame, settings: RenderSettings): void {
+    if (this.probeTimer || !settings.externalHdr) return;
+    const wait = this.extHdr.retryIn(frame, performance.now());
+    if (wait === null) return;
+    this.probeTimer = window.setTimeout(() => {
+      this.probeTimer = 0;
+      if (!this.destroyed && this.last) this.render(this.last.frame, this.last.settings);
+    }, wait + 30);
+  }
+
+  /**
+   * Compare what the import returned for this HDR frame with the browser's 2D-canvas rendition of
+   * the same pixels (external-hdr.ts). Adds a small pass to `encoder`; the returned function
+   * starts the read-back once the commands have been submitted.
+   */
+  private probe(
+    encoder: GPUCommandEncoder,
+    ext: GPUExternalTexture,
+    source: VideoFrame | HTMLVideoElement,
+    frame: MediaFrame,
+    now: number,
+  ): (() => void) | null {
+    const device = this.device;
+    const origins = probeOrigins(frame.width, frame.height);
+    if (!origins) {
+      this.extHdr.giveUp();
+      return null;
+    }
+    const sdr = sampleBrowserSdr(source, origins);
+    if (!sdr) {
+      this.extHdr.miss(now);
+      return null;
+    }
+    if (!this.probeTex) {
+      this.probeTex = device.createTexture({
+        label: 'probe',
+        size: { width: PROBE_SIZE, height: PROBE_SIZE },
+        format: INTERMEDIATE,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+      countTexture(this.stats, 1);
+      this.probeBuf = device.createBuffer({ size: PROBE_SIZE * PROBE_SIZE * 8, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    }
+    const buf = this.probeBuf!;
+    device.queue.writeBuffer(this.uProbe, 0, new Float32Array([frame.width, frame.height, PROBE_TILE, 0, ...origins.x, ...origins.y]));
+    const bind = device.createBindGroup({
+      layout: this.pProbe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uProbe } },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: ext },
+      ],
+    });
+    this.pass(encoder, this.pProbe, bind, this.probeTex.createView());
+    encoder.copyTextureToBuffer(
+      { texture: this.probeTex },
+      { buffer: buf, bytesPerRow: PROBE_SIZE * 8, rowsPerImage: PROBE_SIZE },
+      { width: PROBE_SIZE, height: PROBE_SIZE },
+    );
+    const epoch = this.extHdr.epoch;
+    return () => {
+      this.extHdr.busy = true;
+      buf
+        .mapAsync(GPUMapMode.READ)
+        .then(() => {
+          const half = new Uint16Array(buf.getMappedRange());
+          const rgba = new Float32Array(half.length);
+          for (let i = 0; i < half.length; i++) rgba[i] = halfToFloat(half[i]);
+          buf.unmap();
+          this.extHdr.busy = false;
+          if (this.destroyed || epoch !== this.extHdr.epoch) return;
+          const changed = this.extHdr.report(frame, classifyExternal(rgba, sdr, frame.color, this.extHdr.candidates()), performance.now());
+          this.stats.hdrHandover = this.extHdr.detail;
+          // The assumption this frame was drawn with turned out wrong: draw it again.
+          if (changed && this.last) this.render(this.last.frame, this.last.settings);
+          else if (this.last) this.probeLater(this.last.frame, this.last.settings);
+        })
+        .catch(() => {
+          this.extHdr.busy = false;
+        });
+    };
   }
 
   snapshot(): HTMLCanvasElement | null {
@@ -317,6 +443,7 @@ export class WebGPURenderer implements Renderer {
   /** Forget the last frame (the caller is about to close it). */
   forget(): void {
     this.last = null;
+    this.extHdr.reset();
   }
 
   destroy(): void {
@@ -339,7 +466,15 @@ export class WebGPURenderer implements Renderer {
         this.planes[i] = null;
       }
     }
+    clearTimeout(this.probeTimer);
+    if (this.probeTex) {
+      this.probeTex.destroy();
+      countTexture(this.stats, -1);
+      this.probeTex = null;
+    }
     try {
+      this.probeBuf?.destroy();
+      this.uProbe?.destroy();
       this.uExt?.destroy();
       this.uPlanar?.destroy();
       this.uDeband?.destroy();

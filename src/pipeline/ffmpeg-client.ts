@@ -25,6 +25,8 @@ export interface DecodeRequest {
    */
   preroll?: number;
   duration?: number;
+  /** Length of the whole file in seconds (lets the worker estimate where a slice lies in it). */
+  total?: number;
   maxQueue: number;
   threads?: number;
   eosAtEnd?: boolean;
@@ -162,9 +164,14 @@ export class FfmpegClient {
     });
   }
 
+  /** How the input is being read (for the stats overlay and the notes). */
+  io = '';
+
   async open(source: Blob | string, ext: string): Promise<void> {
-    this.source = typeof source === 'string' ? { url: source, ext } : { blob: source, ext };
-    await this.request({ type: 'open', ...this.source });
+    // The worker resolves the URL itself, and a worker's base URL is not the page's.
+    this.source = typeof source === 'string' ? { url: new URL(source, location.href).href, ext } : { blob: source, ext };
+    const r = await this.request<{ io?: string }>({ type: 'open', ...this.source });
+    this.io = r.io ?? '';
   }
 
   async probe(): Promise<MediaInfo & { video: (MediaInfo['video'] & { ffIndex?: number }) | null }> {
@@ -225,7 +232,7 @@ export class FfmpegClient {
     for (const p of this.pending.values()) p.reject(new Error('ffmpeg worker restarted'));
     this.pending.clear();
     await this.spawn(this.multiThread);
-    if (this.source) await this.request({ type: 'open', ...this.source });
+    if (this.source) this.io = (await this.request<{ io?: string }>({ type: 'open', ...this.source })).io ?? '';
   }
 
   destroy(): void {

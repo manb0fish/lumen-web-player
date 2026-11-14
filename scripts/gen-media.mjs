@@ -284,6 +284,78 @@ add('h264_aac.flv', [...av(), ...X264, '-pix_fmt', 'yuv420p', '-g', '30', '-bf',
   duration: D,
 });
 
+// ---- 1080p clips for decode and network benchmarks ----------------------------------------------
+// Heavier than the rest of the matrix on purpose: full HD with film-grain-like noise at a bitrate
+// a real file would have, so software decoding and streaming have real work to do. Not part of
+// the playback matrix (meta.perf), and the frame counter is not burned in.
+const PERF_SECONDS = 20;
+const perfAv = [
+  '-f',
+  'lavfi',
+  '-i',
+  `testsrc2=size=1920x1080:rate=30:duration=${PERF_SECONDS},format=yuv420p,noise=alls=10:allf=t`,
+  '-f',
+  'lavfi',
+  '-i',
+  `aevalsrc='0.12*sin(2*PI*220*t)':s=48000:c=stereo:d=${PERF_SECONDS}`,
+];
+add(
+  'perf_1080p_h264.mp4',
+  [
+    ...perfAv,
+    '-c:v',
+    'libx264',
+    '-preset',
+    'veryfast',
+    '-profile:v',
+    'high',
+    '-b:v',
+    '8M',
+    '-maxrate',
+    '10M',
+    '-bufsize',
+    '16M',
+    '-g',
+    '60',
+    '-bf',
+    '2',
+    '-pix_fmt',
+    'yuv420p',
+    ...TAG709,
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+    '-movflags',
+    '+faststart',
+  ],
+  { container: 'mp4', video: 'avc', audio: 'aac', bitDepth: 8, fps: 30, duration: PERF_SECONDS, width: 1920, height: 1080, perf: true },
+);
+add(
+  'perf_1080p_hevc10.mkv',
+  [
+    ...perfAv,
+    '-c:v',
+    'libx265',
+    '-preset',
+    'ultrafast',
+    '-x265-params',
+    'log-level=error',
+    '-b:v',
+    '6M',
+    '-g',
+    '60',
+    '-pix_fmt',
+    'yuv420p10le',
+    ...TAG709,
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+  ],
+  { container: 'mkv', video: 'hevc', audio: 'aac', bitDepth: 10, fps: 30, duration: PERF_SECONDS, width: 1920, height: 1080, perf: true },
+);
+
 // ---- audio only ---------------------------------------------------------------------------------
 const a = (d = D) => ['-f', 'lavfi', '-i', beep(d)];
 add('tone.mp3', [...a(), '-c:a', 'libmp3lame', '-b:a', '160k'], { container: 'mp3', video: null, audio: 'mp3', duration: D });

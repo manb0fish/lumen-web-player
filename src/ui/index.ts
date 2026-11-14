@@ -194,6 +194,9 @@ export function mountUI(player: Player, root: HTMLElement, opts: UIOptions = {})
   let autohide = 2500;
   let dockObserver: ResizeObserver | null = null;
   let inspector: InspectorHandle | null = null;
+  // True while the last pointer used was a finger: bigger targets, taps instead of hover.
+  let touch = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+  root.toggleAttribute('data-touch', touch);
 
   const tick = () => {
     raf = requestAnimationFrame(tick);
@@ -292,8 +295,47 @@ export function mountUI(player: Player, root: HTMLElement, opts: UIOptions = {})
       root.style.setProperty('--lp-dock-h', '0px');
     }
     showChrome();
+    fit();
   };
   engine.onApply = rebuild;
+
+  // ---- adaptive layout ----------------------------------------------------------------------------
+  // Whether the controls fit is measured, not assumed. The skin is laid out at full size, and if
+  // any row overflows (or the seek bar is squeezed to a stub) the player switches to "compact":
+  // controls marked hideNarrow go away and the overflow menu takes their place. Because it is a
+  // measurement it holds for any skin, font size and input mode, including skin packages this
+  // code has never seen. "short" marks a low player (a phone held sideways).
+  const fit = () => {
+    const w = root.clientWidth;
+    const h = root.clientHeight;
+    if (!w || !h) return;
+    root.toggleAttribute('data-short', h < 430);
+    root.dataset.size = 'wide';
+    let cramped = false;
+    for (const row of chrome.querySelectorAll<HTMLElement>('.lp-row')) {
+      if (row.scrollWidth > row.clientWidth + 1) cramped = true;
+    }
+    const bar = chrome.querySelector<HTMLElement>('.lp-seekbar');
+    if (bar && bar.offsetWidth > 0 && bar.offsetWidth < Math.min(180, w * 0.4)) cramped = true;
+    if (cramped) root.dataset.size = 'compact';
+  };
+  // Measured on the next frame rather than inside the observer callback: changing the layout from
+  // within it makes the browser report a "ResizeObserver loop" error.
+  let fitFrame = 0;
+  const sizeObserver = new ResizeObserver(() => {
+    cancelAnimationFrame(fitFrame);
+    fitFrame = requestAnimationFrame(fit);
+  });
+  sizeObserver.observe(root);
+  // The time display grows with the duration (hours), so measure again once a file is known.
+  disposers.push(player.store.watch(['duration', 'mediaInfo'], () => fit()));
+
+  const setTouch = (on: boolean) => {
+    if (on === touch) return;
+    touch = on;
+    root.toggleAttribute('data-touch', on);
+    fit();
+  };
 
   // ---- auto-hide ----------------------------------------------------------------------------------
   const showChrome = () => {
@@ -302,7 +344,7 @@ export function mountUI(player: Player, root: HTMLElement, opts: UIOptions = {})
     if (!autohide) return;
     hideTimer = window.setTimeout(() => {
       const s = player.store.state;
-      const hovering = chrome.querySelector('.lp-region:hover') !== null;
+      const hovering = !touch && chrome.querySelector('.lp-region:hover') !== null;
       if (s.paused || s.status !== 'playing' || hovering || isMenuOpen() || overlay.querySelector('.lp-inspector')) {
         showChrome();
         return;
@@ -310,7 +352,16 @@ export function mountUI(player: Player, root: HTMLElement, opts: UIOptions = {})
       root.dataset.chrome = 'hidden';
     }, autohide);
   };
-  const onActivity = () => showChrome();
+  const hideChrome = () => {
+    clearTimeout(hideTimer);
+    if (autohide) root.dataset.chrome = 'hidden';
+  };
+  const onActivity = (e: Event) => {
+    const type = (e as PointerEvent).pointerType;
+    if (type === 'touch') setTouch(true);
+    else if (type === 'mouse') setTouch(false);
+    showChrome();
+  };
   root.addEventListener('pointermove', onActivity);
   root.addEventListener('pointerdown', onActivity);
   root.addEventListener('keydown', onActivity);
@@ -332,14 +383,125 @@ export function mountUI(player: Player, root: HTMLElement, opts: UIOptions = {})
 
   // ---- input ----------------------------------------------------------------------------------------
   disposers.push(player.keys.attach(root, (cmd) => player.command(cmd)));
+  const onStage = (t: EventTarget | null) =>
+    t instanceof Element && !t.closest('[data-lp-chrome], .lp-menu, .lp-inspector, .lp-stats, button, input');
+
+  // Mouse. The browser reports a double-click as click, click, dblclick, so pausing on every click
+  // would pause and resume around each double-click (fullscreen by default). The pause therefore
+  // waits a moment to see whether a second click follows. If the second click comes later than
+  // that, the pause the first one caused is taken back.
+  const DOUBLE_CLICK_MS = 250;
+  let clickTimer = 0;
+  let clickPaused = false;
+  let lastTouchUp = -1e9;
+  const fromTouch = () => performance.now() - lastTouchUp < 600;
   const onClick = (e: MouseEvent) => {
-    const t = e.target as HTMLElement;
-    if (t.closest('[data-lp-chrome], .lp-menu, .lp-inspector, .lp-stats, button, input')) return;
+    if (!onStage(e.target)) return;
     root.focus({ preventScroll: true });
-    if (player.store.state.status === 'idle') mediaInput.click();
-    else if (player.store.state.status !== 'error') player.togglePause();
+    // Taps are handled by the touch gestures below: ignore the click the browser derives from one.
+    if ((e as PointerEvent).pointerType === 'touch' || fromTouch()) return;
+    const status = player.store.state.status;
+    if (status === 'idle') {
+      mediaInput.click();
+      return;
+    }
+    if (status === 'error') return;
+    if (!player.keys.lookup('MBTN_LEFT_DBL')) {
+      player.togglePause(); // nothing is bound to a double-click, so there is nothing to wait for
+      return;
+    }
+    if (e.detail > 1) {
+      if (clickTimer) {
+        clearTimeout(clickTimer);
+        clickTimer = 0;
+      } else if (clickPaused) player.togglePause();
+      clickPaused = false;
+      return;
+    }
+    clearTimeout(clickTimer);
+    clickPaused = false;
+    clickTimer = window.setTimeout(() => {
+      clickTimer = 0;
+      clickPaused = true;
+      player.togglePause();
+    }, DOUBLE_CLICK_MS);
   };
   root.addEventListener('click', onClick);
+
+  // Touch. A tap shows or hides the controls. A double tap seeks 10 s back or forward on the left
+  // or right third of the picture and toggles play/pause in the middle. Skins that keep their
+  // controls on screen (autohide 0) have nothing to show or hide, so there a tap is play/pause.
+  const DOUBLE_TAP_MS = 300;
+  let touchDown: { id: number; x: number; y: number; t: number; hidden: boolean } | null = null;
+  let lastTap = { t: -1e9, x: 0, y: 0 };
+  let tapTimer = 0;
+  const onTouchDown = (e: PointerEvent) => {
+    if (e.pointerType !== 'touch') return;
+    // Capture phase: this runs before the activity handler brings the controls back.
+    touchDown = onStage(e.target)
+      ? { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now(), hidden: root.dataset.chrome === 'hidden' }
+      : null;
+  };
+  const onTouchUp = (e: PointerEvent) => {
+    if (e.pointerType !== 'touch') return;
+    const now = performance.now();
+    lastTouchUp = now;
+    const d = touchDown;
+    touchDown = null;
+    if (!d || d.id !== e.pointerId) return;
+    if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 16 || now - d.t > 500) return; // a drag or a long press
+    const status = player.store.state.status;
+    if (status === 'idle') {
+      mediaInput.click();
+      return;
+    }
+    if (status === 'error') return;
+    if (now - lastTap.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 80) {
+      clearTimeout(tapTimer);
+      tapTimer = 0;
+      lastTap.t = -1e9;
+      const r = root.getBoundingClientRect();
+      const f = (e.clientX - r.left) / Math.max(1, r.width);
+      if (f < 0.35) player.command('seek -10');
+      else if (f > 0.65) player.command('seek 10');
+      else player.togglePause();
+      return;
+    }
+    lastTap = { t: now, x: e.clientX, y: e.clientY };
+    clearTimeout(tapTimer);
+    tapTimer = window.setTimeout(() => {
+      tapTimer = 0;
+      if (!autohide) player.togglePause();
+      else if (!d.hidden && !player.store.state.paused && player.store.state.status === 'playing' && !isMenuOpen()) hideChrome();
+    }, DOUBLE_TAP_MS);
+  };
+  // A double tap must not also run the mouse double-click binding.
+  const onDblClick = (e: MouseEvent) => {
+    if (fromTouch()) e.stopImmediatePropagation();
+  };
+  root.addEventListener('pointerdown', onTouchDown, true);
+  root.addEventListener('pointerup', onTouchUp);
+  root.addEventListener('dblclick', onDblClick, true);
+
+  // On a phone, fullscreen video belongs in landscape. Browsers that cannot lock simply refuse.
+  let orientationLocked = false;
+  disposers.push(
+    player.store.watch(['fullscreen'], (s) => {
+      const o = screen.orientation as (ScreenOrientation & { lock?: (o: string) => Promise<void> }) | undefined;
+      const v = s.mediaInfo?.video;
+      if (s.fullscreen && touch && o?.lock && v && v.displayWidth >= v.displayHeight) {
+        orientationLocked = true;
+        o.lock('landscape').catch(() => (orientationLocked = false));
+      } else if (!s.fullscreen && orientationLocked) {
+        orientationLocked = false;
+        try {
+          o?.unlock();
+        } catch {
+          /* not locked */
+        }
+      }
+    }),
+  );
 
   let dragDepth = 0;
   const onDragEnter = (e: DragEvent) => {
@@ -416,8 +578,12 @@ export function mountUI(player: Player, root: HTMLElement, opts: UIOptions = {})
     destroy() {
       cancelAnimationFrame(raf);
       clearTimeout(hideTimer);
+      clearTimeout(clickTimer);
+      clearTimeout(tapTimer);
       closeMenu();
       dockObserver?.disconnect();
+      sizeObserver.disconnect();
+      cancelAnimationFrame(fitFrame);
       for (const fn of [...cleanups, ...disposers]) {
         try {
           fn();
@@ -430,6 +596,10 @@ export function mountUI(player: Player, root: HTMLElement, opts: UIOptions = {})
       root.removeEventListener('pointerdown', onActivity);
       root.removeEventListener('keydown', onActivity);
       root.removeEventListener('click', onClick);
+      root.removeEventListener('pointerdown', onTouchDown, true);
+      root.removeEventListener('pointerup', onTouchUp);
+      root.removeEventListener('dblclick', onDblClick, true);
+      for (const a of ['data-size', 'data-short', 'data-touch']) root.removeAttribute(a);
       root.removeEventListener('dragenter', onDragEnter);
       root.removeEventListener('dragover', onDragOver);
       root.removeEventListener('dragleave', onDragLeave);

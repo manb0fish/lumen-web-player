@@ -1,27 +1,29 @@
 # Verification results
 
-Recorded 2026-11-11 on Windows 11 with Microsoft Edge 157 (headless) on a six-core desktop PC
-with a discrete GPU. Reproduce with `npm run media` followed by `npm test` (dev server) or
+Recorded 2026-11-13 on Windows 11 with Microsoft Edge 157 (headless) on a six-core desktop PC
+with a discrete GPU (the sync and rendering measurements below are from the 2026-11-11 run). Reproduce with `npm run media` followed by `npm test` (dev server) or
 `npm run test:preview` (production build).
 
 | Run | Result |
 | --- | --- |
-| Dev server | **163 / 163 passed**, 0 flaky, 10.5 min |
-| Production build (`vite build` + `vite preview`) | **163 / 163 passed**, 0 flaky, 10.3 min |
+| Dev server | **202 / 202 passed**, 0 flaky, 12.6 min |
+| Production build (`vite build` + `vite preview`) | **202 / 202 passed**, 0 flaky, 12.4 min |
 
 | Spec | Tests |
 | --- | --- |
 | `01-matrix` — every container × codec on automatic routing | 25 |
-| `02-tiers` — forced WebCodecs / MSE / FFmpeg-WASM / native play-through | 24 |
-| `03-renderers` — WebGPU / WebGL2 / Canvas 2D, colour accuracy, HDR, shaders | 20 |
+| `02-tiers` — forced WebCodecs / MSE / FFmpeg-WASM / native play-through, exact frames after seeks on the remux route | 26 |
+| `03-renderers` — WebGPU / WebGL2 / Canvas 2D, colour accuracy, HDR on every decoding method, gamut mapping, shaders | 25 |
 | `04-sync` — A/V sync, speed, pitch, downmix | 12 |
 | `05-subtitles` — ASS / SRT / WebVTT / PGS, fonts, frame accuracy | 13 |
 | `06-ui` — skins, key bindings, stats, public API | 8 |
 | `07-stress` — seeking, stepping, teardown, leaks | 9 |
 | `08-fallbacks` — degraded environments | 10 |
-| `unit` — AudioWorklet DSP and pure logic, in Node | 42 |
+| `09-mobile` — double-click, touch gestures, small screens | 9 |
+| `10-streaming` — network input, threads, cross-origin isolation | 9 |
+| `unit` — AudioWorklet DSP, input block cache, HDR hand-over check and pure logic, in Node | 56 |
 
-## Test media (synthesised with ffmpeg `lavfi`, 31 clips)
+## Test media (synthesised with ffmpeg `lavfi`, 33 clips)
 
 - Containers: MP4, MKV, WebM, MPEG-TS, AVI, FLV (+ MP3, FLAC, Ogg, M4A audio-only)
 - Video: H.264, HEVC (8 and 10 bit), VP9 (8 and 10 bit), AV1 (8 and 10 bit), MPEG-4 ASP
@@ -33,6 +35,9 @@ with a discrete GPU. Reproduce with `npm run media` followed by `npm test` (dev 
 
 Every video clip carries a 12-bit binary frame counter and a flash synchronised with a beep, so
 tests read the frame number back from rendered pixels and compare it with the audio clock.
+
+Two more clips exist for benchmarks only: 20 s of 1080p with film-grain-like noise, as H.264 at
+8 Mbit/s (20.5 MB) and as 10-bit HEVC at 6 Mbit/s.
 
 ## Automatic routing over the matrix (this machine)
 
@@ -55,6 +60,7 @@ All of them rendered through WebGPU.
 | Frame on screen vs. audio clock (pixel truth), all tiers | mean 0.25–0.27 frames, worst 0.70 | within −2.3 … +1.5 frames |
 | Flash on screen vs. beep audible, WebCodecs | mean −6.5 ms, worst 12.9 ms | each < 45, mean < 25 |
 | Flash on screen vs. beep audible, FFmpeg WASM | mean −3.4 ms, worst 9.1 ms | each < 45, mean < 25 |
+| HDR colour and luminance patches decoded by the browser (WebCodecs, MSE) vs. software-decoded, WebGPU and WebGL2 | within 8 of 255 per channel | ≤ 12 |
 | 60 fps clip | 149 frames on 149 refreshes in 2.5 s, 2 skipped | ≥ 93 % of refreshes |
 | Longest stall while playing 21 routes end to end | 65 ms | < 900 ms |
 | WSOLA pitch at 0.5× … 3× (unit, 220 Hz tone) | 220.0 Hz, full amplitude | ± 0.5 Hz |
@@ -75,6 +81,40 @@ frames the browser reported as dropped came to 238–240 of 240 every time, so t
 that accounting (at least 95 % of frames accounted for, at least 55 % rendered) rather than a
 fixed frame count. The WebCodecs route, which runs its own frame queue, presented 240 of 240 in
 the same measurement.
+
+## Decoding and network (FFmpeg route, 2026-11-12)
+
+The network figures are for the 20.5 MB H.264 benchmark clip served over a simulated link of
+20 Mbit/s with 50 ms of latency per request (the dev server's `/slow/` route, which paces all
+responses together and counts what it serves).
+
+| Check | Result | Limit asserted |
+| --- | --- | --- |
+| Decode rate, 1080p 10-bit HEVC, one thread | 41–44 frames per second | — |
+| Decode rate, same clip, multi-threaded core (now the default) | 120 frames per second (as fast as the 4× speed test asks for) | > 1.3 × single-thread and > 45 |
+| First frame over the link | 1.7 s, after 2.7 MB of the file (published version: 9.1 s, after all of it) | < 5 s and < 60 % of the file |
+| Playback over the link | rate 1.000, longest stall 32 ms, 3 requests in all | rate > 0.97, stall < 300 ms, ≤ 8 requests |
+| Same without `SharedArrayBuffer` | first frame after 3.2 s and 6.8 MB; then rate 1.000, longest stall 28–35 ms | < 6 s; rate > 0.97; stall < 300 ms |
+| Two seeks and a second of playback over an 8 Mbit/s link | exact frames (1002 and 375), a handful of range requests | exact frame; ≤ 8 requests |
+| A file opened from disk, three seeks, with and without `SharedArrayBuffer` | exact frames 1002, 75, 1710 | exact |
+| One thread at a requested 4× (decoder delivers a third of that) | keeps moving, longest stall about 0.3 s (before the fix: stuck in 3 of 6 runs) | stall < 1.5 s in three runs |
+| Unreachable URL | error after about 12 s | < 40 s |
+
+Without `SharedArrayBuffer` and without the network in the way, a decode slice at 1080p now costs
+22.6 ms per frame for H.264 (was 38.9) and 47 ms for 10-bit HEVC (was 110): H.264 plays, 10-bit
+HEVC still does not keep up on one thread, which is why the demo page isolates itself.
+
+## Pointer and small screens (2026-11-12)
+
+| Check | Result |
+| --- | --- |
+| Double-click on the picture | binding runs, the paused flag never changes (it used to flip twice) |
+| Four skins (three built-in, one loaded package) × 375×812, 320×568, 812×375, 768×1024 | no control outside the player; every button at least 40 px (34 px in the mpv skin); play, seek bar and fullscreen always present |
+| Tap / double tap | controls show and hide without pausing; ±10 s on the sides; play/pause in the middle |
+| Overflow menu | bottom sheet across the player; submenus and back; toggles keep it open |
+
+Not covered: real phones and tablets. The layout and gestures were exercised with Chromium's
+touch and mobile emulation only.
 
 ## Defects found and fixed by the suite
 
@@ -97,3 +137,11 @@ the same measurement.
   play-throughs in a reproduction loop), so playback ended early without an error. The dev and
   preview servers now send explicit content types, the matrix spec asserts that every clip is
   served uncompressed, and the same loop then completed 30 of 30.
+- A double-click paused and resumed the video on its way to fullscreen (click, click, dblclick).
+- Below roughly 700 px of width the mpv and Studio skins clipped their buttons off the edge, and on
+  a phone several controls could not be reached at all.
+- The FFmpeg route downloaded the whole file before starting (9 s for 20 MB at 20 Mbit/s) and then
+  read it 32 KiB at a time through a synchronous API.
+- After an audio underrun on the FFmpeg route the player could wait for ever: it wanted 0.3 s of
+  audio, FFmpeg was blocked on a full picture queue and could deliver 0.29 s.
+- A URL that could not be reached was retried without end instead of being reported.

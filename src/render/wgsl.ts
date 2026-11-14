@@ -3,7 +3,9 @@
  *
  *   ingest (external | planar)  ->  [deband]  ->  [scale: bicubic/lanczos | EASU]  ->  final (RCAS + dither)
  *
- * Intermediates are rgba16float holding gamma-encoded, display-referred BT.709 RGB.
+ * Intermediates are rgba16float holding gamma-encoded, display-referred BT.709 RGB. Colour
+ * management (EOTF, tone mapping, gamut mapping) happens in the ingest pass, for both kinds of
+ * frame.
  */
 
 const COMMON = /* wgsl */ `
@@ -36,37 +38,12 @@ fn hash12(p: vec2f) -> f32 {
 }
 `;
 
-export const WGSL_INGEST_EXTERNAL = /* wgsl */ `
-${COMMON}
-struct U { mode: vec4u };
-@group(0) @binding(0) var<uniform> u: U;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var tex: texture_external;
-
-@fragment
-fn fs(in: VSOut) -> @location(0) vec4f {
-  let c = textureSampleBaseClampToEdge(tex, samp, rotUv(in.uv, u.mode.w));
-  return vec4f(c.rgb, 1.0);
-}
-`;
-
-export const WGSL_INGEST_PLANAR = /* wgsl */ `
-${COMMON}
-struct U {
-  m0: vec4f,
-  m1: vec4f,
-  m2: vec4f,
-  off: vec4f,
-  scl: vec4f,
-  pack: vec4f,   // xy = code packing, z = source peak in nits
-  mode: vec4u,   // x = transfer (0 sdr, 1 pq, 2 hlg), y = primaries (0 709, 1 2020, 2 p3), z = tone map, w = rotation
-};
-@group(0) @binding(0) var<uniform> u: U;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var texY: texture_2d<f32>;
-@group(0) @binding(3) var texU: texture_2d<f32>;
-@group(0) @binding(4) var texV: texture_2d<f32>;
-
+/**
+ * Colour management shared by both ingest passes: R'G'B' as coded in the stream in, gamma-encoded
+ * display-referred BT.709 out. Software-decoded planes get here straight from the Y'CbCr matrix;
+ * frames the browser decoded get here once its packaging has been undone (see external-hdr.ts).
+ */
+const COLOR = /* wgsl */ `
 const PQ_M1 = 0.1593017578125;
 const PQ_M2 = 78.84375;
 const PQ_C1 = 0.8359375;
@@ -126,6 +103,157 @@ fn toneCurve(x: f32, peak: f32, kind: u32) -> f32 {
   return pqEotf1(e2 * srcPq) * 10000.0 / SDR_WHITE;
 }
 
+// sRGB EOTF, extended to negative values by symmetry (what GPU colour conversions do).
+fn srgbEotfSigned(v: vec3f) -> vec3f {
+  let a = abs(v);
+  return sign(v) * select(pow((a + 0.055) / 1.055, vec3f(2.4)), a / 12.92, a <= vec3f(0.04045));
+}
+
+// Soft gamut mapping. Saturation is measured along the line from the colour to the grey with the
+// same brightest channel, which is a line of constant dominant wavelength: 1 on the BT.709
+// boundary, lim where the line leaves the source gamut. Up to the knee nothing changes; from the
+// knee to lim it is compressed so that the edge of the source gamut lands on the edge of BT.709
+// (the curve is the one of the ACES reference gamut compression). Hue and the brightest channel
+// are kept, and what a per-channel clip flattens into one colour remains a gradient.
+//   c: linear BT.709, may have negative channels.  src: the same colour in the source primaries.
+const GAMUT_KNEE = 0.95;
+fn gamutCompress(c: vec3f, src: vec3f) -> vec3f {
+  let a = max(c.r, max(c.g, c.b));
+  if (a <= 1e-6) { return vec3f(0.0); }
+  let s = (a - min(c.r, min(c.g, c.b))) / a;
+  var o = c;
+  if (s > GAMUT_KNEE) {
+    // How saturated the colour is by the measure of its own gamut tells how far out the source
+    // boundary lies in this direction.
+    let own = (a - min(src.r, min(src.g, src.b))) / a;
+    let lim = max(s / max(own, 1e-4), 1.0001);
+    let k = (lim - GAMUT_KNEE) / pow(pow((1.0 - GAMUT_KNEE) / (lim - GAMUT_KNEE), -1.2) - 1.0, 1.0 / 1.2);
+    let nd = (s - GAMUT_KNEE) / k;
+    let s2 = GAMUT_KNEE + k * nd / pow(1.0 + pow(nd, 1.2), 1.0 / 1.2);
+    o = vec3f(a) + (c - vec3f(a)) * (s2 / s);
+  }
+  if (a > 1.0) {
+    // Brighter than the display's white in one channel: give up saturation, not luminance.
+    let y = dot(o, vec3f(0.2126, 0.7152, 0.0722));
+    o = mix(o, vec3f(y), clamp((a - 1.0) / max(a - y, 1e-6), 0.0, 1.0));
+  }
+  return o;
+}
+
+// transfer: 0 sdr, 1 pq, 2 hlg.  primaries: 0 709, 1 2020, 2 p3.  tone: curve.  gamut: 0 clip, 1 soft.
+fn colorManage(coded: vec3f, transfer: u32, primaries: u32, tone: u32, gamut: u32, peakNits: f32) -> vec3f {
+  var lin: vec3f;
+  if (transfer == 1u) {
+    lin = pqEotf(clamp(coded, vec3f(0.0), vec3f(1.0))) * (10000.0 / SDR_WHITE);
+  } else if (transfer == 2u) {
+    lin = hlgToDisplay(clamp(coded, vec3f(0.0), vec3f(1.0))) * (1000.0 / SDR_WHITE);
+  } else {
+    lin = pow(max(coded, vec3f(0.0)), vec3f(2.4));
+  }
+  if (transfer != 0u) {
+    let peak = max(peakNits / SDR_WHITE, 1.0);
+    let m = max(max(lin.r, lin.g), max(lin.b, 1e-6));
+    lin *= toneCurve(min(m, peak), peak, tone) / m;
+  }
+  let src = lin;
+  if (primaries == 1u) {
+    lin = vec3f(
+      dot(vec3f(1.660491, -0.587641, -0.072850), src),
+      dot(vec3f(-0.124550, 1.132900, -0.008349), src),
+      dot(vec3f(-0.018151, -0.100579, 1.118730), src));
+  } else if (primaries == 2u) {
+    lin = vec3f(
+      dot(vec3f(1.224940, -0.224940, 0.0), src),
+      dot(vec3f(-0.042057, 1.042057, 0.0), src),
+      dot(vec3f(-0.019638, -0.078636, 1.098274), src));
+  }
+  if (gamut == 1u && primaries != 0u) { lin = gamutCompress(lin, src); }
+  return pow(clamp(lin, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.4));
+}
+`;
+
+export const WGSL_INGEST_EXTERNAL = /* wgsl */ `
+${COMMON}
+${COLOR}
+struct U {
+  mode: vec4u,   // x = packing (0 converted by the browser, 1 coded, 2 coded behind matrix + sRGB OETF), y = transfer, z = primaries, w = rotation
+  opt: vec4u,    // x = tone map, y = gamut mapping
+  p: vec4f,      // x = source peak in nits
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var tex: texture_external;
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f {
+  let c = textureSampleBaseClampToEdge(tex, samp, rotUv(in.uv, u.mode.w)).rgb;
+  if (u.mode.x == 0u) { return vec4f(c, 1.0); }
+  var coded = c;
+  if (u.mode.x == 2u) {
+    // The import took the coded samples for linear light: it converted "primaries" to sRGB's and
+    // applied the sRGB OETF. Both are exact to undo (the target is float, nothing was clipped).
+    let v = srgbEotfSigned(c);
+    if (u.mode.z == 1u) {
+      coded = vec3f(
+        dot(vec3f(0.627404, 0.329283, 0.043313), v),
+        dot(vec3f(0.069097, 0.919540, 0.011362), v),
+        dot(vec3f(0.016391, 0.088013, 0.895595), v));
+    } else if (u.mode.z == 2u) {
+      coded = vec3f(
+        dot(vec3f(0.822462, 0.177538, 0.0), v),
+        dot(vec3f(0.033194, 0.966806, 0.0), v),
+        dot(vec3f(0.017083, 0.072397, 0.910520), v));
+    } else {
+      coded = v;
+    }
+  }
+  return vec4f(colorManage(coded, u.mode.y, u.mode.z, u.opt.x, u.opt.y, u.p.x), 1.0);
+}
+`;
+
+/**
+ * Reads PROBE_TILES x PROBE_TILES tiles of an external texture 1:1, untouched, so that the CPU can
+ * compare them with the browser's 2D-canvas rendition of the same pixels (external-hdr.ts).
+ */
+export const WGSL_PROBE_EXTERNAL = /* wgsl */ `
+${COMMON}
+struct U {
+  size: vec4f,   // source width, height, tile size
+  ox: vec4f,     // left edge of each tile column
+  oy: vec4f,     // top edge of each tile row
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var tex: texture_external;
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f {
+  let p = vec2u(in.pos.xy);
+  let ts = u32(u.size.z);
+  let tile = p / ts;
+  let src = vec2f(u.ox[tile.x], u.oy[tile.y]) + vec2f(p - tile * ts) + 0.5;
+  return vec4f(textureSampleBaseClampToEdge(tex, samp, src / u.size.xy).rgb, 1.0);
+}
+`;
+
+export const WGSL_INGEST_PLANAR = /* wgsl */ `
+${COMMON}
+${COLOR}
+struct U {
+  m0: vec4f,
+  m1: vec4f,
+  m2: vec4f,
+  off: vec4f,
+  scl: vec4f,
+  pack: vec4f,   // xy = code packing, z = source peak in nits, w = gamut mapping (0 clip, 1 soft)
+  mode: vec4u,   // x = transfer (0 sdr, 1 pq, 2 hlg), y = primaries (0 709, 1 2020, 2 p3), z = tone map, w = rotation
+};
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var texY: texture_2d<f32>;
+@group(0) @binding(3) var texU: texture_2d<f32>;
+@group(0) @binding(4) var texV: texture_2d<f32>;
+
 @fragment
 fn fs(in: VSOut) -> @location(0) vec4f {
   let uv = rotUv(in.uv, u.mode.w);
@@ -134,33 +262,8 @@ fn fs(in: VSOut) -> @location(0) vec4f {
   let cr = dot(textureSampleLevel(texV, samp, uv, 0.0).rg, u.pack.xy);
   let yuv = (vec3f(y, cb, cr) - u.off.xyz) * u.scl.xyz;
   var rgb = vec3f(dot(u.m0.xyz, yuv), dot(u.m1.xyz, yuv), dot(u.m2.xyz, yuv));
-
   if (u.mode.x != 0u || u.mode.y != 0u) {
-    var lin: vec3f;
-    if (u.mode.x == 1u) {
-      lin = pqEotf(clamp(rgb, vec3f(0.0), vec3f(1.0))) * (10000.0 / SDR_WHITE);
-    } else if (u.mode.x == 2u) {
-      lin = hlgToDisplay(clamp(rgb, vec3f(0.0), vec3f(1.0))) * (1000.0 / SDR_WHITE);
-    } else {
-      lin = pow(max(rgb, vec3f(0.0)), vec3f(2.4));
-    }
-    if (u.mode.x != 0u) {
-      let peak = max(u.pack.z / SDR_WHITE, 1.0);
-      let m = max(max(lin.r, lin.g), max(lin.b, 1e-6));
-      lin *= toneCurve(min(m, peak), peak, u.mode.z) / m;
-    }
-    if (u.mode.y == 1u) {
-      lin = vec3f(
-        dot(vec3f(1.6605, -0.5876, -0.0728), lin),
-        dot(vec3f(-0.1246, 1.1329, -0.0083), lin),
-        dot(vec3f(-0.0182, -0.1006, 1.1187), lin));
-    } else if (u.mode.y == 2u) {
-      lin = vec3f(
-        dot(vec3f(1.2249, -0.2247, 0.0), lin),
-        dot(vec3f(-0.0420, 1.0419, 0.0), lin),
-        dot(vec3f(-0.0197, -0.0786, 1.0979), lin));
-    }
-    rgb = pow(clamp(lin, vec3f(0.0), vec3f(1.0)), vec3f(1.0 / 2.4));
+    rgb = colorManage(rgb, u.mode.x, u.mode.y, u.mode.z, u32(u.pack.w), u.pack.z);
   }
   return vec4f(rgb, 1.0);
 }

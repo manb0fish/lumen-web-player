@@ -115,11 +115,65 @@ Details that mattered in practice:
 - libavformat buffers 256 KiB per "file" output, which starved audio while video blocked on
   back-pressure → `-flush_packets 1`.
 - For stream-copy into MSE the muxer must keep source timestamps so fragments land at their real
-  position: `-copyts -start_at_zero -avoid_negative_ts disabled -movflags +frag_discont`.
+  position: `-copyts -start_at_zero -avoid_negative_ts disabled -movflags +frag_discont`. With the
+  shift disabled the muxer stays in its edit-list mode, where a fragment starts at the presentation
+  time of its first packet and an edit list is expected to take the B-frame delay back out; an
+  empty `moov` has none, so `+negative_cts_offsets` is needed as well, or every picture of a stream
+  with B-frames is shown that delay too late (two frames for typical H.264).
+- A stream copy that FFmpeg aborts on (video without presentation timestamps, such as B-frames in
+  AVI) leaves the core unusable: the worker is replaced before the player falls back.
 - Containers without a key-frame index (MPEG-TS…) can seek *past* the target; those get a 3 s
   decode pre-roll that is trimmed with `trim/atrim`.
 - The core is probed for its decoder list at start-up; a codec it cannot software-decode is
   reported up front rather than discovered as a stall.
+
+### Threads
+
+The multi-threaded core (`@ffmpeg/core-mt`) is the default wherever it can run: a cross-origin
+isolated page on a machine with at least four logical cores. Measured on the 1080p benchmark
+clips, the decoder alone manages about 42 frames per second of 10-bit HEVC on one thread (barely
+above real time, so any hiccup shows) and more than 110 with threads; H.264 goes from about 70 to
+more than 110. If the threaded core fails to start, the single-thread core takes over.
+
+### Reading the input
+
+FFmpeg pulls its input through synchronous `read()` calls of about 32 KiB, on the thread that
+demuxes and decodes. Handing those straight to a `File` on a network share, or downloading a URL
+in full before starting (what the first version did), either stalls the decoder on every read or
+delays the first frame by the length of the download. Reads therefore go through a block cache
+(`ffmpeg-io.ts`, 256 KiB blocks, 48 MiB):
+
+- A **read-ahead worker** (`io-worker.ts`) streams the source — one HTTP range request, or a
+  stream over the `Blob` — and keeps a 16 MiB window of blocks ready in front of the reader. It
+  follows the reader by the position the reader publishes; when the first missing block is not
+  where the current stream is heading, the stream is reopened there. A seek costs one request;
+  steady playback is one long download that pauses, by not reading, when the window is full.
+- **With SharedArrayBuffer** the cache is shared memory. The worker writes blocks into slots it
+  has claimed (free → filling → ready), and only the reader frees ready slots, so a slot's bytes
+  never change while the reader can see it and no lock is needed. FFmpeg's `read()` becomes a
+  `memcpy`; it waits (on `Atomics.wait`, abortable by a seek) only when it overtakes the network.
+- **Without it** nothing can reach a worker that is inside `exec()`, but a second worker can still
+  download in parallel. It posts the blocks, and they are picked up between two `exec()` calls.
+  Each slice therefore waits (asynchronously, before it starts) until the read-ahead worker has
+  brought in the part of the file it is about to decode, estimated from its position, and then
+  decodes without stopping; anything still missing is fetched synchronously in small pieces. The
+  read-ahead worker cannot see the decoder's cache in this mode, so the decoder tells it exactly
+  which blocks it evicted and which it fetched itself. Guessing instead made the download jump
+  back and forth between the file header, which every slice re-reads, and the data.
+- A server that ignores range requests is detected at open; the file is then downloaded once and
+  read from memory as before.
+
+Eviction is least-recently-used but never touches the window around the reader, so read-ahead
+cannot push out blocks that have not been read yet.
+
+### Without cross-origin isolation
+
+No SharedArrayBuffer means no threads and no way to pace a running `exec()`, so decoding happens
+in self-contained slices. A slice that starts in the middle of a GOP must decode from the previous
+key frame again, which is why slices are made as long as memory allows (about 192 MB of frames on
+machines with 8 GB or more). This path is a fallback: 1080p H.264 plays, 10-bit HEVC at 1080p does
+not keep up on one thread. The demo page therefore turns isolation on by itself where the server
+does not (see "Cross-origin isolation" in the guide).
 
 ## 4. A/V sync
 
@@ -129,6 +183,13 @@ Details that mattered in practice:
   because the raw pair jitters by a few milliseconds.
 - Video is scheduled against the **vsync-aligned rAF timestamp plus one refresh** (when the frame
   actually reaches the glass), not against "now". This removed cadence beating at 60 fps.
+- A source that decodes audio and video in one process (FFmpeg) delivers them in file order and
+  stops when the picture queue is full. After an audio underrun that used to be a standoff: the
+  player wanted 0.3 s of audio before restarting the clock, the ten 1080p frames that fill the
+  queue come with about 0.29 s, and no more could arrive because the queue was full and the clock
+  stopped. While audio is short and the queue is full, the pipeline now lets extra pictures
+  through (up to about three seconds or 256 MB) and takes the allowance back once audio is
+  plentiful. Files that interleave audio and video coarsely need the same slack.
 - The clock is **held** (not just the picture) during preroll and whenever video or audio runs
   dry, so the two cannot drift while rebuffering. A watchdog reports a decoder that never
   produces a frame instead of waiting forever.
@@ -147,9 +208,50 @@ still works), or a `<video>` element. The pass chain is identical in WGSL and GL
 ingest ──► [deband] ──► [scale: bicubic | Lanczos-3 | EASU-style] ──► RCAS sharpen + dither ──► canvas
 ```
 
-The planar ingest shader does range expansion, BT.601/709/2020 matrices, PQ and HLG EOTFs, tone
-mapping (BT.2390, Hable, Reinhard, clip) and BT.2020/P3 → BT.709 gamut conversion. Intermediates
-are RGBA16F. Canvas 2D is the compatibility floor (CPU YUV→RGB for planar frames).
+The ingest pass is where colour is managed, by one shader function for every kind of frame:
+PQ and HLG EOTFs, tone mapping (BT.2390, Hable, Reinhard, clip) and BT.2020/P3 → BT.709 gamut
+mapping. For planar frames it follows range expansion and the BT.601/709/2020 matrix; for frames
+the browser decoded it follows the unpacking described below. Intermediates are RGBA16F. Canvas 2D
+is the compatibility floor (CPU YUV→RGB for planar frames, the browser's conversion for the rest).
+
+### HDR frames the browser decoded
+
+A `VideoFrame` or a `<video>` element reaches a shader through the browser's own import, and for
+HDR that import is not the conversion it is for SDR. Measured in Chromium (Edge, Windows; HEVC,
+AV1 and VP9; PQ and HLG; GPU-backed frames, which is what both hardware decoders and `<video>`
+deliver), for grey patches of 100 / 203 / 400 / 1000 nits:
+
+| Path | What arrives | On screen, untouched |
+| --- | --- | --- |
+| WebGPU `importExternalTexture` | sRGB-OETF(primaries → sRGB matrix × coded R′G′B′), float | 189 / 200 / 210 / 225 |
+| WebGL2 `texImage2D` | coded R′G′B′, 8 bit whatever the target format | 130 / 147 / 165 / 192 |
+| Canvas 2D `drawImage`, `copyTo(RGBA)` | tone-mapped SDR, mid-tones at half their light | 137 / 185 / 220 / 255 |
+| *our pipeline on software-decoded planes* | | 191 / 230 / 250 / 255 |
+
+The two GPU imports have no PQ or HLG transfer function, so they leave it out: the picture is
+code values shown as if they were SDR, flat and grey. That is why HDR used to look right only on
+the FFmpeg route. Both are exactly reversible (WebGPU's target is float, nothing is clipped), so
+the external ingest pass now undoes them and hands the coded samples to the same colour function
+as planar frames; the four routes then agree to within a few code values.
+
+Because none of this is specified, the renderer does not simply assume it (`external-hdr.ts`). It
+starts from the packing its API is known to produce in Chromium, then reads a few hundred pixels
+of an early frame both through the import and through a 2D canvas, the one conversion that is the
+browser's considered opinion. A packing is accepted only if the light it implies is a constant
+multiple of the canvas version in the mid-tones, where every tone curve is a straight line (the
+check holds with and without HDR10 static metadata, which only moves the highlights). If the
+import already equals the canvas, or fits nothing known, the frame is left as the browser made
+it. The verdict is shown in the stats overlay ("HDR samples").
+
+### Gamut mapping
+
+BT.2020 and P3 colours that BT.709 cannot show are not clipped per channel by default: saturation
+is compressed towards the grey of the same brightest channel, along a line of constant dominant
+wavelength, so that the edge of the source gamut lands on the edge of BT.709. Up to 95 % of the
+way to that edge nothing changes; beyond it the ACES reference-gamut-compression curve is used.
+Clipping turns every out-of-gamut green into the same BT.709 green and shifts hues towards the
+display primaries; this keeps hue and gradation. A highlight too saturated for display white
+gives up saturation rather than luminance. `set gamut-mapping clip` restores the old behaviour.
 
 Renderer creation degrades WebGPU → WebGL2 → Canvas 2D; a lost GPU context triggers the same
 chain at runtime.
@@ -197,7 +299,7 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 | **Single-thread FFmpeg core by default, pthread core opt-in** (`wasmThreads` / `?threads=1`) | The pthread core spins up a 32-worker pool at start; the single-thread core already exceeds real time on the test matrix. | Large software-decoded streams benefit from enabling threads. |
 | **mediabunny for demux/remux** | Maintained, streaming, covers MP4/MOV/MKV/WebM/TS/Ogg/MP3/FLAC/WAV, and can write fragmented MP4 for the MSE tier. | No AVI/FLV (→ FFmpeg), no subtitle tracks (→ own Matroska scanner). |
 | **JASSUB (libass WASM)** for ASS | Real libass = real compatibility with complex typesetting. | The first draw after the overlay is created or resized does not reach the screen unless another frame follows; the manager issues confirming repaints when paused. |
-| **External textures for SDR, own shaders for planar/HDR** | Zero-copy where the browser's conversion is correct; full control where it matters. | Hardware-decoded HDR frames whose pixel format cannot be read back use the browser's conversion; software-decoded HDR goes through our tone mapping. |
+| **External textures for SDR, own shaders for planar/HDR** | Zero-copy where the browser's conversion is correct; full control where it matters. | HDR frames that cannot be read back as planes are imported as the browser packs them and unpacked in the shader, which rests on unspecified behaviour: it is checked per stream against the browser's 2D-canvas conversion and abandoned when the check fails. |
 | **Matroska scan reads the file sequentially** | No index for subtitle blocks. | For URL sources the file is fetched once in the background to scan it. |
 | **Skin CSS scoping via native CSS nesting** | No build step for skin authors. | Requires browsers with CSS nesting (all current engines). |
 
@@ -206,4 +308,13 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 - Software AV1 decode in the FFmpeg tier (see above).
 - MP4 `tx3g` / non-Matroska embedded text subtitles are not extracted (external files work).
 - Pixel aspect ratio other than 1:1 is not applied by the canvas renderers.
-- HDR is tone-mapped to SDR; there is no HDR canvas output path yet.
+- HDR is tone-mapped to SDR; there is no HDR canvas output path yet. The mastering peak is taken
+  to be 1000 nits: static HDR10 metadata is not read and the peak is not measured per scene.
+- WebGL2 receives only 8 bits of an HDR frame the browser decoded, so fine gradients can band
+  there (deband helps); WebGPU gets the full depth. The Canvas 2D renderer shows such frames as
+  the browser converts them, about a stop darker than the other two.
+- FLV and AVI files whose video has B-frames do not start at position 0 on the FFmpeg routes:
+  FFmpeg aims its seek a little before the target, these two demuxers fail a seek to before the
+  start, and reading resumes at the second key frame. Opened or sought further in, they play.
+- Without cross-origin isolation the FFmpeg tier is single-threaded and decodes in slices: fine
+  for 1080p H.264, not fast enough for 1080p 10-bit HEVC.

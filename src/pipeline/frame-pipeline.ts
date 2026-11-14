@@ -52,6 +52,13 @@ export class FramePipeline implements Pipeline {
   private seeking = false;
   private prerollSince = 0;
   private prerollReported = false;
+  /** Frames a coupled source may send beyond the queue limit while audio is short (see service). */
+  private allowance = 0;
+  private lastAllowanceSent = 0;
+  private lastAllowanceAt = 0;
+  private lastAllowanceCut = 0;
+  private readonly allowanceCap: number;
+  private readonly coupled: boolean;
 
   constructor(
     info: MediaInfo,
@@ -66,6 +73,11 @@ export class FramePipeline implements Pipeline {
     this.frameDur = 1 / (info.video?.fps || 30);
     this.duration = info.duration;
     this.videoSemantics = sources.find((s) => s.provides.video)?.seekSemantics ?? 'containing';
+    this.coupled = sources.some((s) => s.coupled);
+    // Up to about three seconds of extra pictures, within roughly 256 MB.
+    const v = info.video;
+    const frameBytes = v ? v.width * v.height * 1.5 * (v.bitDepth > 8 ? 2 : 1) : 1;
+    this.allowanceCap = Math.max(8, Math.min(Math.ceil((v?.fps || 30) * 3), Math.floor(256e6 / frameBytes)));
     for (const s of sources) {
       s.onFrame = (frame, gen) => this.onFrame(frame, gen);
       s.onEos = (kind, gen) => this.onEos(kind, gen);
@@ -253,11 +265,32 @@ export class FramePipeline implements Pipeline {
 
     this.audio.setPlaying(this.clockRunning);
 
+    // -- break the back-pressure standoff of a coupled source
+    // A source that decodes audio and video in one process delivers them in file order and stops
+    // as soon as the picture queue is full. The audio it has delivered by then covers about as
+    // much time as the queued pictures (less if the file interleaves coarsely). When that is not
+    // enough to restart the clock (after an underrun we want 0.3 s of audio; ten queued 1080p
+    // frames come with about 0.29 s), nothing can move again: the queue stays full because the
+    // clock is stopped, and audio cannot arrive because the queue is full. So while audio is short
+    // and the queue is full, let more pictures through, and take that back once audio is plentiful.
+    if (this.coupled && this.hasVideo && this.hasAudio && now - this.lastAllowanceAt >= 40) {
+      this.lastAllowanceAt = now;
+      const full = this.queue.length >= this.maxQueue + this.allowance - 1;
+      const audioShort =
+        !this.audioEos && (this.hold === 'audio' || (this.hold === 'preroll' && rep.buffered < 0.12) || rep.starved || rep.buffered < 0.1);
+      if (full && audioShort) this.allowance = Math.min(this.allowanceCap, this.allowance + 2);
+      else if (this.allowance > 0 && rep.buffered >= 1 && now - this.lastAllowanceCut > 500) {
+        this.lastAllowanceCut = now;
+        this.allowance--;
+      }
+    }
+
     // -- feed watermarks to the sources
-    if (now - this.lastSourceTick > 33 || this.released !== this.lastReleasedSent) {
+    if (now - this.lastSourceTick > 33 || this.released !== this.lastReleasedSent || this.allowance !== this.lastAllowanceSent) {
       this.lastSourceTick = now;
       this.lastReleasedSent = this.released;
-      for (const s of this.sources) s.tick(this.gen, t, this.rate, this.clockRunning, this.released);
+      this.lastAllowanceSent = this.allowance;
+      for (const s of this.sources) s.tick(this.gen, t, this.rate, this.clockRunning, this.released + this.allowance);
     }
 
     // -- publish coarse state
@@ -291,6 +324,7 @@ export class FramePipeline implements Pipeline {
     this.ended = false;
     this.released = 0;
     this.lastReleasedSent = -1;
+    this.allowance = 0;
     this.showNext = this.hasVideo;
     this.shownForGen = false;
     this.hold = 'preroll';

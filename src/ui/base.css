@@ -42,6 +42,8 @@
   --lp-osd-bg: rgba(0, 0, 0, 0.55);
   /* docked skins reserve this much height below the picture */
   --lp-dock-h: 0px;
+  /* smallest comfortable target for the current pointer; raised for touch input further down */
+  --lp-touch-min: 0px;
 
   position: relative;
   width: 100%;
@@ -54,6 +56,9 @@
   user-select: none;
   outline: none;
   container-type: inline-size;
+  /* the player handles taps and double taps itself: no double-tap zoom, no grey flash */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 .lp-root *,
 .lp-root *::before,
@@ -82,6 +87,11 @@
   flex-direction: column;
   justify-content: space-between;
   transition: opacity var(--lp-anim) ease;
+}
+.lp-root[data-fullscreen='true'] .lp-chrome,
+.lp-root[data-fullscreen='true'] .lp-osd {
+  /* keep clear of notches and rounded corners */
+  margin: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
 }
 .lp-root[data-chrome='hidden'] .lp-chrome {
   opacity: 0;
@@ -134,8 +144,8 @@
   justify-content: center;
   gap: 6px;
   flex: none;
-  min-width: var(--lp-button-size);
-  height: var(--lp-button-size);
+  min-width: max(var(--lp-button-size), var(--lp-touch-min));
+  height: max(var(--lp-button-size), var(--lp-touch-min));
   padding: 0 8px;
   border: 0;
   border-radius: var(--lp-radius-sm);
@@ -166,6 +176,10 @@
 .lp-btn[disabled] {
   opacity: 0.35;
   pointer-events: none;
+}
+.lp-big-play[data-state='off'],
+.lp-big-play[data-state='playing'] {
+  display: none;
 }
 .lp-icon {
   width: var(--lp-icon-size);
@@ -746,10 +760,130 @@
   color: var(--lp-fg-dim);
 }
 
-@container (max-width: 560px) {
-  .lp-hide-narrow {
-    display: none !important;
-  }
+/* ---------- compact layout ----------
+ * data-size is set by the UI from a measurement: "compact" means the skin's rows did not fit.
+ * Controls a skin marks hideNarrow go away and the overflow menu ("more") appears in their place.
+ */
+.lp-show-narrow {
+  display: none !important;
+}
+.lp-root[data-size='compact'] .lp-hide-narrow {
+  display: none !important;
+}
+.lp-root[data-size='compact'] .lp-show-narrow {
+  display: inline-flex !important;
+}
+.lp-root[data-size='compact'] .lp-region .lp-row {
+  /* last resort on very narrow players: a second line rather than clipped buttons */
+  flex-wrap: wrap;
+}
+.lp-root[data-size='compact'] .lp-row > .lp-seekbar {
+  /* a seek bar that shares its row with buttons gets a line of its own, above them */
+  order: -1;
+  flex-basis: 100%;
+}
+.lp-root[data-size='compact'] .lp-title {
+  flex: 1 1 0;
+}
+.lp-root[data-size='compact'] .lp-badge {
+  display: none;
+}
+/* menus become a sheet along the bottom edge */
+.lp-root[data-size='compact'] .lp-menu {
+  left: 8px !important;
+  right: 8px;
+  top: auto !important;
+  bottom: 8px !important;
+  max-width: none;
+  max-height: min(72%, 540px);
+  box-shadow:
+    0 -6px 40px rgba(0, 0, 0, 0.6),
+    0 0 0 100vmax rgba(0, 0, 0, 0.35);
+}
+.lp-root[data-size='compact'][data-short] .lp-menu {
+  max-height: calc(100% - 16px);
+}
+.lp-root[data-size='compact'] .lp-inspector {
+  left: 8px;
+  right: 8px;
+  top: 8px;
+  bottom: calc(8px + var(--lp-dock-h));
+  width: auto;
+}
+.lp-root[data-size='compact'] .lp-osd {
+  padding: 12px 14px;
+}
+.lp-root[data-size='compact'] .lp-osd-box {
+  max-width: 92%;
+  font-size: min(var(--lp-osd-size), 17px);
+}
+.lp-root[data-size='compact'] .lp-osd-bar {
+  min-width: min(180px, 60cqw);
+}
+.lp-root[data-size='compact'] .lp-stats {
+  left: 8px;
+  top: 8px;
+  max-width: calc(100% - 16px);
+  max-height: calc(100% - 16px - var(--lp-dock-h));
+  font-size: 10.5px;
+}
+.lp-root[data-size='compact'] .lp-seek-thumbnail {
+  width: 128px;
+  height: 72px;
+}
+.lp-root[data-size='compact'] .lp-idle {
+  padding: 0 24px;
+}
+
+/* ---------- touch input ----------
+ * data-touch is present while the last pointer used was a finger.
+ */
+.lp-root[data-touch] {
+  --lp-touch-min: 40px;
+}
+.lp-root[data-touch] .lp-btn:hover {
+  /* :hover sticks to the last element tapped */
+  background: transparent;
+}
+.lp-root[data-touch] .lp-btn:active {
+  background: rgba(255, 255, 255, 0.16);
+}
+.lp-root[data-touch] .lp-big-play[data-state='playing'] {
+  display: inline-flex;
+}
+.lp-root[data-touch] .lp-seekbar {
+  height: 34px;
+}
+.lp-root[data-touch] .lp-seek-track {
+  height: max(var(--lp-seek-height), 5px);
+}
+.lp-root[data-touch] .lp-seek-thumb {
+  transform: scale(1.15);
+}
+.lp-root[data-touch] .lp-range {
+  height: 34px;
+}
+.lp-root[data-touch] .lp-range::-webkit-slider-thumb {
+  width: 18px;
+  height: 18px;
+  margin-top: -7px;
+}
+.lp-root[data-touch] .lp-menu {
+  font-size: 14px;
+  overscroll-behavior: contain;
+}
+.lp-root[data-touch] .lp-menu-item {
+  padding: 12px 12px;
+}
+.lp-root[data-touch] .lp-menu-item:hover {
+  background: transparent;
+}
+.lp-root[data-touch] .lp-menu-item:active {
+  background: rgba(255, 255, 255, 0.12);
+}
+.lp-root[data-touch] .lp-inspector-tabs button,
+.lp-root[data-touch] .lp-inspector-actions .lp-btn {
+  min-height: 36px;
 }
 @media (prefers-reduced-motion: reduce) {
   .lp-root {

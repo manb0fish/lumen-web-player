@@ -34,16 +34,17 @@
         "play",
         { "control": "prev-frame", "hideNarrow": true },
         { "control": "next-frame", "hideNarrow": true },
-        "mute",
+        { "control": "mute", "hideNarrow": true },
         { "control": "volume", "hideNarrow": true },
         "time",
         "spacer",
         { "control": "speed", "hideNarrow": true },
         "subtitles",
-        "audio",
-        "video",
+        { "control": "audio", "hideNarrow": true },
+        { "control": "video", "hideNarrow": true },
         { "control": "tier", "hideNarrow": true },
         { "control": "stats", "hideNarrow": true },
+        "more",
         "fullscreen"
       ]
     ]

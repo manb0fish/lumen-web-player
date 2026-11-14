@@ -139,11 +139,21 @@ function bitDepthFromCodecString(s: string | null): number {
   return 8;
 }
 
+/**
+ * Mediabunny retries a failed request for ever by default. Ride out a short network blip
+ * (about twelve seconds in all), then let the load fail with an error the player can show.
+ */
+const retryDelay = (previousAttempts: number): number | null => (previousAttempts >= 6 ? null : Math.min(4, 0.25 * 2 ** previousAttempts));
+
 async function open(source: Blob | string): Promise<any> {
   closeInput();
   input = new Input({
     formats: ALL_FORMATS,
-    source: typeof source === 'string' ? new UrlSource(source) : new BlobSource(source),
+    source:
+      typeof source === 'string'
+        ? new UrlSource(source, { getRetryDelay: retryDelay })
+        : // A larger cache than the 8 MiB default: files opened from a network share read slowly.
+          new BlobSource(source, { maxCacheSize: 32 * 1024 * 1024 }),
   });
   if (!(await input.canRead())) {
     closeInput();
