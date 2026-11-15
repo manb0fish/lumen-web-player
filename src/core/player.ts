@@ -3,11 +3,13 @@ import { AudioEngine } from '../audio/engine';
 import { ElementPipeline, FfmpegFeeder, MediabunnyFeeder } from '../pipeline/element-pipeline';
 import { FfmpegClient } from '../pipeline/ffmpeg-client';
 import { FramePipeline } from '../pipeline/frame-pipeline';
+import { mergeHdrMetadata } from '../pipeline/hdr-metadata';
 import { MediaWorkerClient, type ProbeResult } from '../pipeline/media-client';
 import { buildMime, detectCapabilities, planForeign, planReadable, type Capabilities, type WasmMode } from '../pipeline/router';
 import { FfmpegSource, WebCodecsSource } from '../pipeline/sources';
 import { frameLedger, type Pipeline, type PipelineCallbacks, type PipelineStats } from '../pipeline/types';
 import { createRenderer, textureLedger, type Renderer } from '../render';
+import { describeHdrMetadata } from '../render/peak';
 import { SubtitleManager } from '../subs/manager';
 import { CommandBus } from './commands';
 import { KeyBindings } from './keybindings';
@@ -18,6 +20,7 @@ import {
   formatTime,
   type MediaFrame,
   type MediaInfo,
+  type PeakSource,
   type PlayerState,
   type RendererKind,
   type RendererRequest,
@@ -92,6 +95,10 @@ export interface PlayerStats {
   chain: string;
   /** How HDR frames decoded by the browser are being read; empty when none have been shown. */
   hdrHandover: string;
+  /** The peak the HDR frame on screen is tone-mapped with and where it comes from; empty when none is. */
+  hdrPeak: string;
+  /** The stream's static HDR10 metadata; empty when it has none. */
+  hdrMetadata: string;
   container: string;
   video: string;
   audio: string;
@@ -136,6 +143,8 @@ function initialState(o: PlayerOptions): PlayerState {
     sharpen: DEFAULT_RENDER_SETTINGS.sharpen,
     toneMapping: DEFAULT_RENDER_SETTINGS.toneMapping,
     gamutMapping: DEFAULT_RENDER_SETTINGS.gamutMapping,
+    hdrPeakSource: DEFAULT_RENDER_SETTINGS.hdrPeakSource,
+    hdrPeak: DEFAULT_RENDER_SETTINGS.hdrPeak,
     dither: DEFAULT_RENDER_SETTINGS.dither,
     linearScaling: DEFAULT_RENDER_SETTINGS.linearScaling,
     normalize: false,
@@ -312,6 +321,15 @@ export class Player {
     await ff.init({ multiThread: threads });
     await ff.open(this.source!, this.sourceExt);
     this.ffmpegInfo = await ff.probe();
+    // The two demuxers find static HDR metadata in different places (hdr-metadata.ts): what one
+    // of them knows holds for the stream, whichever of them ends up feeding the renderer.
+    const own = this.ffmpegInfo.video?.color;
+    const other = this.probe?.info?.video?.color;
+    if (own && other) {
+      const merged = mergeHdrMetadata(own.hdrMetadata, other.hdrMetadata) ?? undefined;
+      own.hdrMetadata = merged;
+      other.hdrMetadata = merged;
+    }
     this.note(
       `FFmpeg core ready (${ff.multiThread ? 'pthreads' : 'single-thread'}, ${ff.shared ? 'SharedArrayBuffer flow control' : 'segmented, no SharedArrayBuffer'})`,
     );
@@ -997,6 +1015,7 @@ export class Player {
     const sub = this.subs.debug;
     const mem = (performance as any).memory;
     const c = v?.color;
+    this.renderer?.refreshStats();
     return {
       time: this.currentTime,
       duration: s.duration,
@@ -1008,6 +1027,8 @@ export class Player {
       rendererDetail: s.rendererDetail,
       chain: rs?.chain ?? (s.renderer === 'native' ? 'browser compositor' : 'idle'),
       hdrHandover: rs?.hdrHandover ?? '',
+      hdrPeak: rs?.hdrPeak ?? '',
+      hdrMetadata: describeHdrMetadata(c),
       container: info ? `${info.container} (${info.demuxer})` : '-',
       video: v
         ? `${v.codec} ${v.width}x${v.height} ${v.fps}fps ${v.bitDepth}-bit${v.codecString ? ' [' + v.codecString + ']' : ''}`
@@ -1316,6 +1337,29 @@ export class Player {
         this.applySettings({ gamutMapping: v });
       },
       osd: (v) => `Gamut mapping: ${v}`,
+    });
+    c.defineProperty('hdr-peak-source', {
+      type: 'choice',
+      choices: () => ['measured', 'metadata', 'fixed'],
+      get: () => s().hdrPeakSource,
+      set: (v: PeakSource) => {
+        this.store.set({ hdrPeakSource: v });
+        this.applySettings({ hdrPeakSource: v });
+      },
+      osd: (v) =>
+        `HDR peak: ${v === 'measured' ? 'measured per scene' : v === 'metadata' ? "the stream's metadata" : `fixed, ${s().hdrPeak} nits`}`,
+    });
+    c.defineProperty('hdr-peak', {
+      type: 'number',
+      min: 203,
+      max: 10000,
+      step: 100,
+      get: () => s().hdrPeak,
+      set: (v) => {
+        this.store.set({ hdrPeak: v });
+        this.applySettings({ hdrPeak: v });
+      },
+      osd: (v) => `HDR peak: ${Math.round(Number(v))} nits${s().hdrPeakSource === 'fixed' ? '' : ' (used when nothing better is known)'}`,
     });
     bool(
       'dither',

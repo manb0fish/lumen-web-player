@@ -6,7 +6,12 @@
  * Intermediates are rgba16float holding gamma-encoded, display-referred BT.709 RGB. Colour
  * management (EOTF, tone mapping, gamut mapping) happens in the ingest pass, for both kinds of
  * frame.
+ *
+ * HDR frames whose peak is measured get two small passes before the ingest (see peak.ts):
+ *
+ *   measure (external | planar)  ->  reduce + smooth  ->  1x1 state, read by the ingest pass
  */
+import { PEAK_GRID } from './peak';
 
 const COMMON = /* wgsl */ `
 struct VSOut {
@@ -140,16 +145,18 @@ fn gamutCompress(c: vec3f, src: vec3f) -> vec3f {
   return o;
 }
 
-// transfer: 0 sdr, 1 pq, 2 hlg.  primaries: 0 709, 1 2020, 2 p3.  tone: curve.  gamut: 0 clip, 1 soft.
+// Display light of a coded sample: linear, relative to SDR reference white, in the source primaries.
+// transfer: 0 sdr, 1 pq, 2 hlg.
+fn sourceLight(coded: vec3f, transfer: u32) -> vec3f {
+  if (transfer == 1u) { return pqEotf(clamp(coded, vec3f(0.0), vec3f(1.0))) * (10000.0 / SDR_WHITE); }
+  if (transfer == 2u) { return hlgToDisplay(clamp(coded, vec3f(0.0), vec3f(1.0))) * (1000.0 / SDR_WHITE); }
+  return pow(max(coded, vec3f(0.0)), vec3f(2.4));
+}
+
+// primaries: 0 709, 1 2020, 2 p3.  tone: curve.  gamut: 0 clip, 1 soft.  peakNits: what the curve
+// brings down to display white.
 fn colorManage(coded: vec3f, transfer: u32, primaries: u32, tone: u32, gamut: u32, peakNits: f32) -> vec3f {
-  var lin: vec3f;
-  if (transfer == 1u) {
-    lin = pqEotf(clamp(coded, vec3f(0.0), vec3f(1.0))) * (10000.0 / SDR_WHITE);
-  } else if (transfer == 2u) {
-    lin = hlgToDisplay(clamp(coded, vec3f(0.0), vec3f(1.0))) * (1000.0 / SDR_WHITE);
-  } else {
-    lin = pow(max(coded, vec3f(0.0)), vec3f(2.4));
-  }
+  var lin = sourceLight(coded, transfer);
   if (transfer != 0u) {
     let peak = max(peakNits / SDR_WHITE, 1.0);
     let m = max(max(lin.r, lin.g), max(lin.b, 1e-6));
@@ -172,43 +179,96 @@ fn colorManage(coded: vec3f, transfer: u32, primaries: u32, tone: u32, gamut: u3
 }
 `;
 
-export const WGSL_INGEST_EXTERNAL = /* wgsl */ `
-${COMMON}
-${COLOR}
+/**
+ * The measured peak, as the reduce pass left it: a 1x1 texture, r = peak, g = mean, both as PQ
+ * signal values of the brightest channel.
+ */
+const peakState = (binding: number) => /* wgsl */ `
+@group(0) @binding(${binding}) var peakState: texture_2d<f32>;
+fn measuredPeak() -> f32 {
+  return pqEotf1(textureLoad(peakState, vec2i(0, 0), 0).r) * 10000.0;
+}
+`;
+
+/**
+ * One cell of the measuring grid per fragment. Expects the source to define codedAt(uv),
+ * srcTransfer() and srcTaps().
+ */
+const MEASURE = /* wgsl */ `
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f {
+  let cell = floor(in.pos.xy);
+  let n = vec2i(srcTaps());
+  var hi = 0.0;
+  var sum = 0.0;
+  for (var j = 0; j < n.y; j++) {
+    for (var i = 0; i < n.x; i++) {
+      let uv = (cell + (vec2f(f32(i), f32(j)) + 0.5) / vec2f(n)) / ${PEAK_GRID}.0;
+      let lin = sourceLight(codedAt(uv), srcTransfer());
+      let v = pqOetf1(max(lin.r, max(lin.g, lin.b)) * (SDR_WHITE / 10000.0));
+      hi = max(hi, v);
+      sum += v;
+    }
+  }
+  return vec4f(hi, sum / f32(n.x * n.y), 0.0, 1.0);
+}
+`;
+
+const EXTERNAL_SOURCE = /* wgsl */ `
 struct U {
   mode: vec4u,   // x = packing (0 converted by the browser, 1 coded, 2 coded behind matrix + sRGB OETF), y = transfer, z = primaries, w = rotation
-  opt: vec4u,    // x = tone map, y = gamut mapping
-  p: vec4f,      // x = source peak in nits
+  opt: vec4u,    // x = tone map, y = gamut mapping, z = 1: the peak is the measured one
+  p: vec4f,      // x = source peak in nits (when not measured), yz = taps per cell of the measure pass
 };
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var tex: texture_external;
 
+fn srcTransfer() -> u32 { return u.mode.y; }
+fn srcTaps() -> vec2f { return u.p.yz; }
+
+// The sample at uv as the stream coded it: R'G'B', still PQ or HLG, in the source primaries.
+fn codedAt(uv: vec2f) -> vec3f {
+  let c = textureSampleBaseClampToEdge(tex, samp, uv).rgb;
+  if (u.mode.x != 2u) { return c; }
+  // The import took the coded samples for linear light: it converted "primaries" to sRGB's and
+  // applied the sRGB OETF. Both are exact to undo (the target is float, nothing was clipped).
+  let v = srgbEotfSigned(c);
+  if (u.mode.z == 1u) {
+    return vec3f(
+      dot(vec3f(0.627404, 0.329283, 0.043313), v),
+      dot(vec3f(0.069097, 0.919540, 0.011362), v),
+      dot(vec3f(0.016391, 0.088013, 0.895595), v));
+  }
+  if (u.mode.z == 2u) {
+    return vec3f(
+      dot(vec3f(0.822462, 0.177538, 0.0), v),
+      dot(vec3f(0.033194, 0.966806, 0.0), v),
+      dot(vec3f(0.017083, 0.072397, 0.910520), v));
+  }
+  return v;
+}
+`;
+
+export const WGSL_INGEST_EXTERNAL = /* wgsl */ `
+${COMMON}
+${COLOR}
+${EXTERNAL_SOURCE}
+${peakState(3)}
 @fragment
 fn fs(in: VSOut) -> @location(0) vec4f {
-  let c = textureSampleBaseClampToEdge(tex, samp, rotUv(in.uv, u.mode.w)).rgb;
-  if (u.mode.x == 0u) { return vec4f(c, 1.0); }
-  var coded = c;
-  if (u.mode.x == 2u) {
-    // The import took the coded samples for linear light: it converted "primaries" to sRGB's and
-    // applied the sRGB OETF. Both are exact to undo (the target is float, nothing was clipped).
-    let v = srgbEotfSigned(c);
-    if (u.mode.z == 1u) {
-      coded = vec3f(
-        dot(vec3f(0.627404, 0.329283, 0.043313), v),
-        dot(vec3f(0.069097, 0.919540, 0.011362), v),
-        dot(vec3f(0.016391, 0.088013, 0.895595), v));
-    } else if (u.mode.z == 2u) {
-      coded = vec3f(
-        dot(vec3f(0.822462, 0.177538, 0.0), v),
-        dot(vec3f(0.033194, 0.966806, 0.0), v),
-        dot(vec3f(0.017083, 0.072397, 0.910520), v));
-    } else {
-      coded = v;
-    }
-  }
-  return vec4f(colorManage(coded, u.mode.y, u.mode.z, u.opt.x, u.opt.y, u.p.x), 1.0);
+  let uv = rotUv(in.uv, u.mode.w);
+  if (u.mode.x == 0u) { return vec4f(textureSampleBaseClampToEdge(tex, samp, uv).rgb, 1.0); }
+  let peak = select(u.p.x, measuredPeak(), u.opt.z == 1u);
+  return vec4f(colorManage(codedAt(uv), u.mode.y, u.mode.z, u.opt.x, u.opt.y, peak), 1.0);
 }
+`;
+
+export const WGSL_MEASURE_EXTERNAL = /* wgsl */ `
+${COMMON}
+${COLOR}
+${EXTERNAL_SOURCE}
+${MEASURE}
 `;
 
 /**
@@ -236,16 +296,15 @@ fn fs(in: VSOut) -> @location(0) vec4f {
 }
 `;
 
-export const WGSL_INGEST_PLANAR = /* wgsl */ `
-${COMMON}
-${COLOR}
+const PLANAR_SOURCE = /* wgsl */ `
 struct U {
   m0: vec4f,
   m1: vec4f,
   m2: vec4f,
   off: vec4f,
   scl: vec4f,
-  pack: vec4f,   // xy = code packing, z = source peak in nits, w = gamut mapping (0 clip, 1 soft)
+  pack: vec4f,   // xy = code packing, z = source peak in nits (when not measured), w = gamut mapping (0 clip, 1 soft)
+  meas: vec4f,   // x = 1: the peak is the measured one, yz = taps per cell of the measure pass
   mode: vec4u,   // x = transfer (0 sdr, 1 pq, 2 hlg), y = primaries (0 709, 1 2020, 2 p3), z = tone map, w = rotation
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -254,18 +313,70 @@ struct U {
 @group(0) @binding(3) var texU: texture_2d<f32>;
 @group(0) @binding(4) var texV: texture_2d<f32>;
 
-@fragment
-fn fs(in: VSOut) -> @location(0) vec4f {
-  let uv = rotUv(in.uv, u.mode.w);
+fn srcTransfer() -> u32 { return u.mode.x; }
+fn srcTaps() -> vec2f { return u.meas.yz; }
+
+// The sample at uv as R'G'B': range expanded, through the stream's Y'CbCr matrix.
+fn codedAt(uv: vec2f) -> vec3f {
   let y = dot(textureSampleLevel(texY, samp, uv, 0.0).rg, u.pack.xy);
   let cb = dot(textureSampleLevel(texU, samp, uv, 0.0).rg, u.pack.xy);
   let cr = dot(textureSampleLevel(texV, samp, uv, 0.0).rg, u.pack.xy);
   let yuv = (vec3f(y, cb, cr) - u.off.xyz) * u.scl.xyz;
-  var rgb = vec3f(dot(u.m0.xyz, yuv), dot(u.m1.xyz, yuv), dot(u.m2.xyz, yuv));
+  return vec3f(dot(u.m0.xyz, yuv), dot(u.m1.xyz, yuv), dot(u.m2.xyz, yuv));
+}
+`;
+
+export const WGSL_INGEST_PLANAR = /* wgsl */ `
+${COMMON}
+${COLOR}
+${PLANAR_SOURCE}
+${peakState(5)}
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f {
+  var rgb = codedAt(rotUv(in.uv, u.mode.w));
   if (u.mode.x != 0u || u.mode.y != 0u) {
-    rgb = colorManage(rgb, u.mode.x, u.mode.y, u.mode.z, u32(u.pack.w), u.pack.z);
+    let peak = select(u.pack.z, measuredPeak(), u.meas.x > 0.5);
+    rgb = colorManage(rgb, u.mode.x, u.mode.y, u.mode.z, u32(u.pack.w), peak);
   }
   return vec4f(rgb, 1.0);
+}
+`;
+
+export const WGSL_MEASURE_PLANAR = /* wgsl */ `
+${COMMON}
+${COLOR}
+${PLANAR_SOURCE}
+${MEASURE}
+`;
+
+/**
+ * Brings the measuring grid down to one value and blends it into the state of the previous
+ * picture: a low-pass in PQ space that lets go when the scene changes (peak.ts).
+ */
+export const WGSL_PEAK_REDUCE = /* wgsl */ `
+${COMMON}
+struct U { p: vec4f };   // x = 1: start over from this picture, y = weight of this picture in the low-pass, zw = scene-change thresholds
+@group(0) @binding(0) var<uniform> u: U;
+@group(0) @binding(1) var grid: texture_2d<f32>;
+@group(0) @binding(2) var prev: texture_2d<f32>;
+
+@fragment
+fn fs(in: VSOut) -> @location(0) vec4f {
+  var hi = 0.0;
+  var sum = 0.0;
+  for (var y = 0; y < ${PEAK_GRID}; y++) {
+    for (var x = 0; x < ${PEAK_GRID}; x++) {
+      let c = textureLoad(grid, vec2i(x, y), 0).rg;
+      hi = max(hi, c.r);
+      sum += c.g;
+    }
+  }
+  let cur = vec2f(hi, sum / ${PEAK_GRID * PEAK_GRID}.0);
+  if (u.p.x > 0.5) { return vec4f(cur, 0.0, 1.0); }
+  let old = textureLoad(prev, vec2i(0, 0), 0).rg;
+  // Follow slowly, unless the mean says this is another scene: then go there at once.
+  let k = max(u.p.y, smoothstep(u.p.z, u.p.w, abs(cur.g - old.g)));
+  return vec4f(mix(old, cur, k), 0.0, 1.0);
 }
 `;
 

@@ -4,8 +4,10 @@ import {
   type ExternalPacking,
   frameDisplaySize,
   gamutMapCode,
+  isHdrTransfer,
   kernelCode,
   packingCode,
+  pqEotf,
   primariesCode,
   rotationCode,
   toneMapCode,
@@ -19,10 +21,24 @@ import {
   GLSL_FINAL,
   GLSL_INGEST_EXTERNAL,
   GLSL_INGEST_PLANAR,
+  GLSL_MEASURE_EXTERNAL,
+  GLSL_MEASURE_PLANAR,
+  GLSL_PEAK_REDUCE,
   GLSL_PROBE_EXTERNAL,
   GLSL_SCALE,
   GLSL_VERT,
 } from './glsl';
+import {
+  choosePeak,
+  describeMeasuredPeak,
+  PEAK_GRID,
+  PEAK_SCENE_HIGH,
+  PEAK_SCENE_LOW,
+  peakKey,
+  type PeakStep,
+  peakTaps,
+  PeakTracker,
+} from './peak';
 import { copyCanvas, countTexture, makeCanvas, newStats, type Renderer, type RendererStats } from './renderer';
 
 interface Program {
@@ -44,11 +60,15 @@ interface Plane {
   wide: boolean;
 }
 
+/** What every program that reads planar frames is given (PLANAR_SOURCE in glsl.ts). */
+const PLANAR_UNIFORMS = ['uTexY', 'uTexU', 'uTexV', 'uM0', 'uM1', 'uM2', 'uOff', 'uScl', 'uPack', 'uMode'];
+
 /**
  * WebGL2 fallback renderer: same pass chain as WebGPU, GLSL ES 3.00, RGBA16F intermediates when
  * available. HDR frames decoded by the browser arrive here as coded samples too, but only 8 bits
  * of them (texImage2D quantises whatever the target format): colours are right, fine gradients
- * can band where WebGPU's stay smooth.
+ * can band where WebGPU's stay smooth. The HDR peak is measured as on WebGPU (peak.ts) wherever
+ * float textures can be rendered to.
  */
 export class WebGL2Renderer implements Renderer {
   readonly kind = 'webgl2' as const;
@@ -66,6 +86,20 @@ export class WebGL2Renderer implements Renderer {
   private pEasu!: Program;
   private pFinal!: Program;
   private pProbe!: Program;
+  private pMeasureExt: Program | null = null;
+  private pMeasurePlanar: Program | null = null;
+  private pReduce: Program | null = null;
+  private peakGrid: Target | null = null;
+  /** Ping-pong: the reduce pass reads the state of the previous picture and writes the other one. */
+  private peakState: Target[] = [];
+  private peakCur = 0;
+  private peak = new PeakTracker();
+  /** Null until the first HDR picture asks: the measuring passes are built then, not at start-up. */
+  private canMeasure: boolean | null = null;
+  private float32 = false;
+  /** The frame on the canvas was tone-mapped with the measured peak. */
+  private peakLive = false;
+  private peakReading = false;
   private probe: Target | null = null;
   private extHdr = new ExternalHdrTracker('webgl2');
   private probeTimer = 0;
@@ -94,7 +128,8 @@ export class WebGL2Renderer implements Renderer {
     if (!gl) throw new Error('WebGL2 is not available');
     this.gl = gl;
     this.canvas.addEventListener('webglcontextlost', this.onContextLost);
-    this.floatTargets = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+    this.float32 = !!gl.getExtension('EXT_color_buffer_float');
+    this.floatTargets = this.float32 || !!gl.getExtension('EXT_color_buffer_half_float');
     const dbg = gl.getExtension('WEBGL_debug_renderer_info');
     const name = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
     this.detail = `${name}${this.floatTargets ? '' : ' (8-bit intermediates)'}`;
@@ -103,26 +138,47 @@ export class WebGL2Renderer implements Renderer {
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.BLEND);
-    this.pExt = this.program('ingest-external', GLSL_INGEST_EXTERNAL, ['uTex', 'uMode', 'uOpt', 'uPeak']);
+    this.pExt = this.program('ingest-external', GLSL_INGEST_EXTERNAL, ['uTex', 'uMode', 'uOpt', 'uPeak', 'uPeakState']);
     this.pProbe = this.program('probe-external', GLSL_PROBE_EXTERNAL, ['uTex', 'uOx', 'uOy', 'uTile']);
-    this.pPlanar = this.program('ingest-planar', GLSL_INGEST_PLANAR, [
-      'uTexY',
-      'uTexU',
-      'uTexV',
-      'uM0',
-      'uM1',
-      'uM2',
-      'uOff',
-      'uScl',
-      'uPack',
-      'uPeak',
-      'uMode',
-      'uGamut',
-    ]);
+    this.pPlanar = this.program('ingest-planar', GLSL_INGEST_PLANAR, [...PLANAR_UNIFORMS, 'uPeak', 'uOpt', 'uPeakState']);
     this.pDeband = this.program('deband', GLSL_DEBAND, ['uTex', 'uP']);
     this.pScale = this.program('scale', GLSL_SCALE, ['uTex', 'uSize', 'uOpt']);
     this.pEasu = this.program('easu', GLSL_EASU, ['uTex', 'uSize']);
     this.pFinal = this.program('final', GLSL_FINAL, ['uTex', 'uP']);
+    // The measured peak is a running average: full floats where they can be rendered to, or its
+    // small steps would be rounded away. The ingest shaders name the state, so it exists from the
+    // start; everything else about measuring waits for the first HDR picture (measuring()).
+    const state = this.float32 ? gl.RGBA32F : gl.RGBA16F;
+    this.peakState = [this.fixedTarget(1, state), this.fixedTarget(1, state)];
+  }
+
+  /**
+   * Whether this context can measure the HDR peak. The first call builds the measuring programs
+   * and the grid, so that playback of SDR never pays for them. It makes and binds a texture:
+   * call it before a frame's own textures are bound.
+   */
+  private measuring(): boolean {
+    if (this.canMeasure !== null) return this.canMeasure;
+    this.canMeasure = false;
+    const gl = this.gl;
+    if (!this.floatTargets) return false;
+    try {
+      this.pMeasureExt = this.program('measure-external', GLSL_MEASURE_EXTERNAL, ['uTex', 'uMode', 'uTaps']);
+      this.pMeasurePlanar = this.program('measure-planar', GLSL_MEASURE_PLANAR, [...PLANAR_UNIFORMS, 'uTaps']);
+      this.pReduce = this.program('peak-reduce', GLSL_PEAK_REDUCE, ['uGrid', 'uPrev', 'uP']);
+      const grid = this.fixedTarget(PEAK_GRID, gl.RGBA16F);
+      this.peakGrid = grid;
+      const complete = (t: Target) => {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+        const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        return ok;
+      };
+      this.canMeasure = [grid, ...this.peakState].every(complete);
+    } catch {
+      /* a driver that cannot compile them: the peak comes from the metadata or the fixed value */
+    }
+    return this.canMeasure;
   }
 
   private program(label: string, frag: string, uniforms: string[]): Program {
@@ -201,6 +257,51 @@ export class WebGL2Renderer implements Renderer {
     return t;
   }
 
+  /** A square float target of a fixed size. */
+  private fixedTarget(size: number, format: number): Target {
+    const gl = this.gl;
+    const tex = this.newTexture(gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, format, size, size, 0, gl.RGBA, format === gl.RGBA32F ? gl.FLOAT : gl.HALF_FLOAT, null);
+    const fbo = gl.createFramebuffer()!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fbo, w: size, h: size };
+  }
+
+  /**
+   * The two passes that measure a new picture (peak.ts). The measuring program is in use, with
+   * the frame bound as the ingest pass will see it. Afterwards peakState[peakCur] is the state
+   * to tone-map this picture with. Uses texture units 4 and 5, which no ingest pass touches.
+   */
+  private measurePeak(taps: WebGLUniformLocation | null, width: number, height: number, step: PeakStep): void {
+    const gl = this.gl;
+    const grid = this.peakGrid!;
+    const reduce = this.pReduce!;
+    const n = peakTaps(width, height);
+    gl.uniform2i(taps, n[0], n[1]);
+    this.draw(grid.fbo, grid.w, grid.h);
+    const prev = this.peakCur;
+    this.peakCur ^= 1;
+    gl.useProgram(reduce.prog);
+    gl.activeTexture(gl.TEXTURE4);
+    gl.bindTexture(gl.TEXTURE_2D, grid.tex);
+    gl.activeTexture(gl.TEXTURE5);
+    gl.bindTexture(gl.TEXTURE_2D, this.peakState[prev].tex);
+    gl.uniform1i(reduce.u.uGrid, 4);
+    gl.uniform1i(reduce.u.uPrev, 5);
+    gl.uniform4f(reduce.u.uP, step.reset ? 1 : 0, step.alpha, PEAK_SCENE_LOW, PEAK_SCENE_HIGH);
+    this.draw(this.peakState[this.peakCur].fbo, 1, 1);
+  }
+
+  /** Texture unit 3 is the measured peak, for the ingest program now in use. */
+  private bindPeakState(p: Program): void {
+    const gl = this.gl;
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.peakState[this.peakCur].tex);
+    gl.uniform1i(p.u.uPeakState, 3);
+  }
+
   private uploadPlanar(frame: PlanarFrame): void {
     const gl = this.gl;
     const wide = frame.bitDepth > 8;
@@ -254,27 +355,45 @@ export class WebGL2Renderer implements Renderer {
     this.frameNo++;
     gl.bindVertexArray(this.vao);
     let packing: ExternalPacking = 'converted';
+    let peakDetail = '';
+    let measured = false;
+    // Asked before any of the frame's textures are bound (the first answer builds the passes).
+    const ours = frame.kind === 'planar' || settings.externalHdr;
+    const canMeasure = ours && settings.hdrPeakSource === 'measured' && isHdrTransfer(frame.color) && this.measuring();
 
     const A = this.target('A', disp.width, disp.height);
 
     if (frame.kind === 'planar') {
       this.uploadPlanar(frame);
-      const p = this.pPlanar;
       const yuv = yuvUniforms(frame.color, frame.bitDepth, frame.height);
       const m = yuv.matrix;
-      gl.useProgram(p.prog);
-      gl.uniform1i(p.u.uTexY, 0);
-      gl.uniform1i(p.u.uTexU, 1);
-      gl.uniform1i(p.u.uTexV, 2);
-      gl.uniform3f(p.u.uM0, m[0], m[1], m[2]);
-      gl.uniform3f(p.u.uM1, m[3], m[4], m[5]);
-      gl.uniform3f(p.u.uM2, m[6], m[7], m[8]);
-      gl.uniform3f(p.u.uOff, yuv.offset[0], yuv.offset[1], yuv.offset[2]);
-      gl.uniform3f(p.u.uScl, yuv.scale[0], yuv.scale[1], yuv.scale[2]);
-      gl.uniform2f(p.u.uPack, yuv.pack[0], yuv.pack[1]);
-      gl.uniform1f(p.u.uPeak, settings.hdrPeak);
-      gl.uniform4i(p.u.uMode, transferCode(frame.color), primariesCode(frame.color), toneMapCode(settings.toneMapping), rot);
-      gl.uniform1i(p.u.uGamut, gamutMapCode(settings.gamutMapping));
+      // The planes as R'G'B', for whichever program reads them.
+      const source = (p: Program) => {
+        gl.useProgram(p.prog);
+        gl.uniform1i(p.u.uTexY, 0);
+        gl.uniform1i(p.u.uTexU, 1);
+        gl.uniform1i(p.u.uTexV, 2);
+        gl.uniform3f(p.u.uM0, m[0], m[1], m[2]);
+        gl.uniform3f(p.u.uM1, m[3], m[4], m[5]);
+        gl.uniform3f(p.u.uM2, m[6], m[7], m[8]);
+        gl.uniform3f(p.u.uOff, yuv.offset[0], yuv.offset[1], yuv.offset[2]);
+        gl.uniform3f(p.u.uScl, yuv.scale[0], yuv.scale[1], yuv.scale[2]);
+        gl.uniform2f(p.u.uPack, yuv.pack[0], yuv.pack[1]);
+        gl.uniform4i(p.u.uMode, transferCode(frame.color), primariesCode(frame.color), toneMapCode(settings.toneMapping), rot);
+      };
+      const peak = isHdrTransfer(frame.color) ? choosePeak(frame.color, settings, canMeasure) : null;
+      measured = peak?.source === 'measured';
+      peakDetail = peak?.detail ?? '';
+      const step = measured ? this.peak.step(frame, peakKey(frame, '')) : null;
+      if (step) {
+        source(this.pMeasurePlanar!);
+        this.measurePeak(this.pMeasurePlanar!.u.uTaps, frame.width, frame.height, step);
+      }
+      const p = this.pPlanar;
+      source(p);
+      gl.uniform1f(p.u.uPeak, peak?.nits ?? settings.hdrPeak);
+      gl.uniform2i(p.u.uOpt, gamutMapCode(settings.gamutMapping), measured ? 1 : 0);
+      this.bindPeakState(p);
       this.draw(A.fbo, A.w, A.h);
     } else {
       if (!this.extTex) this.extTex = this.newTexture(gl.LINEAR);
@@ -289,13 +408,27 @@ export class WebGL2Renderer implements Renderer {
       // Reading back is synchronous here, so even the first frame is drawn with a checked packing.
       if (settings.externalHdr && this.extHdr.wantsProbe(frame, t0)) this.probeExternal(src, frame, t0);
       packing = settings.externalHdr ? this.extHdr.packingFor(frame) : 'converted';
-      gl.useProgram(this.pExt.prog);
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindTexture(gl.TEXTURE_2D, this.extTex);
-      gl.uniform1i(this.pExt.u.uTex, 0);
-      gl.uniform4i(this.pExt.u.uMode, packingCode(packing), transferCode(frame.color), primariesCode(frame.color), rot);
-      gl.uniform2i(this.pExt.u.uOpt, toneMapCode(settings.toneMapping), gamutMapCode(settings.gamutMapping));
-      gl.uniform1f(this.pExt.u.uPeak, settings.hdrPeak);
+      // The upload as coded samples, for whichever program reads it.
+      const source = (p: Program) => {
+        gl.useProgram(p.prog);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.extTex);
+        gl.uniform1i(p.u.uTex, 0);
+        gl.uniform4i(p.u.uMode, packingCode(packing), transferCode(frame.color), primariesCode(frame.color), rot);
+      };
+      // Only samples that go through our tone curve have a peak to speak of.
+      const peak = packing !== 'converted' && isHdrTransfer(frame.color) ? choosePeak(frame.color, settings, canMeasure) : null;
+      measured = peak?.source === 'measured';
+      peakDetail = peak?.detail ?? '';
+      const step = measured ? this.peak.step(frame, peakKey(frame, packing)) : null;
+      if (step) {
+        source(this.pMeasureExt!);
+        this.measurePeak(this.pMeasureExt!.u.uTaps, frame.width, frame.height, step);
+      }
+      source(this.pExt);
+      gl.uniform3i(this.pExt.u.uOpt, toneMapCode(settings.toneMapping), gamutMapCode(settings.gamutMapping), measured ? 1 : 0);
+      gl.uniform1f(this.pExt.u.uPeak, peak?.nits ?? settings.hdrPeak);
+      this.bindPeakState(this.pExt);
       this.draw(A.fbo, A.w, A.h);
     }
     let cur: Target = A;
@@ -334,7 +467,59 @@ export class WebGL2Renderer implements Renderer {
     this.stats.lastRenderMs = performance.now() - t0;
     this.stats.chain = describeChain(frame, settings, outW, outH, packing);
     if (frame.kind !== 'planar' && packing !== 'converted') this.stats.hdrHandover = this.extHdr.detail;
+    // A measured peak is known to the GPU only: refreshStats() fills in its text.
+    if (!measured || !this.peakLive) this.stats.hdrPeak = peakDetail;
+    this.peakLive = measured;
     this.probeLater(frame, settings);
+  }
+
+  /** Reads the state through a pixel-pack buffer and a fence, so that nothing waits for the GPU. */
+  readPeak(): Promise<{ peak: number; mean: number } | null> {
+    const gl = this.gl;
+    if (this.destroyed || !this.peakLive || gl.isContextLost()) return Promise.resolve(null);
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buf);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, 16, gl.STREAM_READ);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.peakState[this.peakCur].fbo);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    return new Promise((resolve) => {
+      const poll = () => {
+        if (this.destroyed || gl.isContextLost() || !sync) {
+          resolve(null);
+          return;
+        }
+        const status = gl.clientWaitSync(sync, 0, 0);
+        if (status === gl.TIMEOUT_EXPIRED) {
+          setTimeout(poll, 4);
+          return;
+        }
+        gl.deleteSync(sync);
+        let out: { peak: number; mean: number } | null = null;
+        if (status !== gl.WAIT_FAILED) {
+          const state = new Float32Array(4);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, buf);
+          gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, state);
+          gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+          out = { peak: pqEotf(state[0]), mean: pqEotf(state[1]) };
+        }
+        gl.deleteBuffer(buf);
+        resolve(out);
+      };
+      setTimeout(poll, 0);
+    });
+  }
+
+  refreshStats(): void {
+    if (this.peakReading || !this.peakLive) return;
+    this.peakReading = true;
+    void this.readPeak().then((v) => {
+      this.peakReading = false;
+      if (v && this.peakLive && !this.destroyed) this.stats.hdrPeak = describeMeasuredPeak(v.peak, v.mean);
+    });
   }
 
   /** A paused player draws nothing new: come back by ourselves while a frame is still unchecked. */
@@ -392,6 +577,7 @@ export class WebGL2Renderer implements Renderer {
   forget(): void {
     this.last = null;
     this.extHdr.reset();
+    this.peak.reset();
   }
 
   destroy(): void {
@@ -424,7 +610,16 @@ export class WebGL2Renderer implements Renderer {
         gl.deleteFramebuffer(this.probe.fbo);
         this.probe = null;
       }
-      for (const p of [this.pExt, this.pPlanar, this.pDeband, this.pScale, this.pEasu, this.pFinal, this.pProbe]) {
+      for (const t of [this.peakGrid, ...this.peakState]) {
+        if (t) {
+          this.deleteTexture(t.tex);
+          gl.deleteFramebuffer(t.fbo);
+        }
+      }
+      this.peakGrid = null;
+      this.peakState = [];
+      const programs = [this.pExt, this.pPlanar, this.pDeband, this.pScale, this.pEasu, this.pFinal, this.pProbe];
+      for (const p of [...programs, this.pMeasureExt, this.pMeasurePlanar, this.pReduce]) {
         if (p) gl.deleteProgram(p.prog);
       }
       gl.deleteVertexArray(this.vao);

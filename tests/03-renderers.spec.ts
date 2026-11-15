@@ -1,4 +1,6 @@
 import { expect, test } from '@playwright/test';
+import { pqEotf, pqOetf } from '../src/render/color';
+import { PEAK_TAU } from '../src/render/peak';
 import {
   destroyPlayer,
   expectColorNear,
@@ -144,6 +146,10 @@ test.describe('HDR (BT.2020 PQ) tone mapping in our shaders', () => {
       expect(st.colorSpace).toContain('HDR');
       expect(st.chain).toContain('pq→sdr');
       expect(st.chain).toContain('2020→709');
+      // This picture never passes SDR white. Told that its source reaches 1000 nits, every curve
+      // makes room for highlights that do not come; that is what is compared here.
+      await page.evaluate(() => window.player.command('set hdr-peak-source fixed'));
+      expect(st.hdrMetadata, 'the clip carries no static metadata').toBe('');
       const seen: Record<string, number[][]> = {};
       for (const op of ['bt2390', 'hable', 'reinhard', 'clip']) {
         await page.evaluate((o) => window.player.command(`set tone-mapping ${o}`), op);
@@ -169,6 +175,15 @@ test.describe('HDR (BT.2020 PQ) tone mapping in our shaders', () => {
       expect(Math.abs(grayOf('hable') - grayOf('clip'))).toBeGreaterThan(2);
       expect(Math.abs(grayOf('reinhard') - grayOf('clip'))).toBeGreaterThan(2);
       expect(Math.abs(grayOf('hable') - grayOf('reinhard'))).toBeGreaterThan(2);
+      // Measured, there is nothing to make room for: the peak is SDR white itself, and the curves
+      // that are the identity there leave the picture as a clip would.
+      await page.evaluate(() => window.player.command('set hdr-peak-source measured'));
+      for (const op of ['bt2390', 'reinhard']) {
+        await page.evaluate((o) => window.player.command(`set tone-mapping ${o}`), op);
+        await page.waitForTimeout(80);
+        const px = await samplePatches(page);
+        names.forEach((n, i) => expectColorNear(px[i], seen.clip[i], 3, `${r} ${op} with the measured peak, ${n}`));
+      }
       expectNoErrors(errors);
     });
 
@@ -287,6 +302,352 @@ test.describe('HDR frames decoded by the browser get the same colour pipeline as
     expect(r.handover).toBe('');
     // Coded samples on screen: the grey patch is far from the 135 of the managed picture.
     expect(Math.abs(r.px[3][1] - 135)).toBeGreaterThan(25);
+    expectNoErrors(errors);
+  });
+});
+
+test.describe('HDR peak: what the stream says and what the picture shows replace the 1000-nit assumption', () => {
+  // hdr_pq_peaks.mkv: two seconds that never pass 400 nits (50 / 100 / 203 / 400), a hard cut,
+  // two seconds that reach 4000 (203 / 1000 / 2000 / 4000). Tagged MaxCLL 4000, mastered at 4000.
+  const HP = manifest.hdrPeaks;
+  const ROUTES = [
+    ['wasm', 'wasm-sw'],
+    ['webcodecs', 'webcodecs'],
+    ['mse', 'mse-remux'],
+  ] as const;
+  type P = import('@playwright/test').Page;
+  const cmd = (page: P, c: string) => page.evaluate((x) => window.player.command(x), c);
+  // Green: the hardware path leaves a slight tint on some flat patches, least of it there.
+  const levels = async (page: P) => (await samplePatches(page)).map((p) => p[1]);
+  const readPeak = (page: P): Promise<{ peak: number; mean: number } | null> =>
+    page.evaluate(() => (window.player as any).renderer.readPeak());
+
+  for (const r of ['webgpu', 'webgl2'] as const) {
+    test(`${r}: 4000 nits tagged as 4000 nits are rolled off instead of clipped, on every decoding route`, async ({ page }) => {
+      for (const [tier, mode] of ROUTES) {
+        const errors = await openApp(page, { renderer: r, tier });
+        await load(page, 'hdr_pq_peaks.mkv');
+        await cmd(page, 'set dither no ; set hdr-peak-source metadata');
+        await seekPaused(page, HP.cut + 1);
+        const st = await stats(page);
+        expect(st.mode).toBe(mode);
+        expect(st.renderer).toBe(r);
+        // SEI messages in the HEVC stream: read by ffprobe on one route, by our own parser on the others.
+        expect(st.hdrMetadata, tier).toBe('MaxCLL 4000, MaxFALL 1800, mastering display 0.005–4000 nits');
+        expect(st.hdrPeak, tier).toBe('4000 nits (MaxCLL)');
+        const seen: Record<string, number[]> = {};
+        for (const op of ['bt2390', 'hable', 'reinhard']) {
+          await cmd(page, `set tone-mapping ${op}`);
+          await page.waitForTimeout(80);
+          const [l203, l1000, l2000, l4000] = (seen[op] = await levels(page));
+          const what = `${r} ${tier} ${op}: ${seen[op].map((v) => v.toFixed(1))}`;
+          // Every step up in the source is a step up on screen, and the stated peak is display white.
+          expect(l1000 - l203, what).toBeGreaterThan(30);
+          expect(l2000 - l1000, what).toBeGreaterThan(op === 'bt2390' ? 2.5 : 8);
+          expect(l4000 - l2000, what).toBeGreaterThan(op === 'bt2390' ? 0.5 : 6);
+          expect(l1000, `${what}: 1000 nits stays below white`).toBeLessThan(252);
+          expect(l4000, `${what}: the peak is white`).toBeGreaterThan(253);
+        }
+        // The old assumption, for comparison: everything from 1000 nits up is one flat white ...
+        await cmd(page, 'set tone-mapping bt2390 ; set hdr-peak-source fixed');
+        await page.waitForTimeout(80);
+        expect((await stats(page)).hdrPeak).toBe('1000 nits (fixed)');
+        const fixed = await levels(page);
+        expect(
+          Math.min(fixed[1], fixed[2], fixed[3]),
+          `${r} ${tier} fixed at 1000 nits: ${fixed.map((v) => v.toFixed(1))}`,
+        ).toBeGreaterThan(253);
+        // ... and reference white sits higher, because less room was kept above it.
+        expect(fixed[0] - seen.bt2390[0]).toBeGreaterThan(12);
+        // The fixed value can be set, and then does what the metadata did.
+        await cmd(page, 'set hdr-peak 4000');
+        await page.waitForTimeout(80);
+        expect((await stats(page)).hdrPeak).toBe('4000 nits (fixed)');
+        (await levels(page)).forEach((v, i) =>
+          expect(Math.abs(v - seen.bt2390[i]), `fixed 4000 equals MaxCLL 4000, patch ${i}`).toBeLessThan(1.5),
+        );
+        expectNoErrors(errors);
+      }
+    });
+
+    test(`${r}: a scene that peaks at 400 nits is brighter with the measured peak than with the assumption, on every route`, async ({
+      page,
+    }) => {
+      for (const [tier, mode] of ROUTES) {
+        const errors = await openApp(page, { renderer: r, tier });
+        await load(page, 'hdr_pq_peaks.mkv');
+        await cmd(page, 'set dither no');
+        await seekPaused(page, HP.cut - 1);
+        expect((await state(page)).hdrPeakSource, 'measuring is the default').toBe('measured');
+        expect((await stats(page)).mode).toBe(mode);
+        // The number stays on the GPU; the overlay asks for it.
+        await expect
+          .poll(async () => (await stats(page)).hdrPeak, { timeout: 5000 })
+          .toMatch(/^4\d\d nits \(measured; picture average 1\d\d nits\)$/);
+        const m = (await readPeak(page))!;
+        expect(m.peak, `${r} ${tier}: measured peak`).toBeGreaterThan(385);
+        expect(m.peak, `${r} ${tier}: measured peak`).toBeLessThan(450);
+        const seen: Record<string, Record<string, number[]>> = {};
+        for (const source of ['measured', 'fixed', 'metadata']) {
+          seen[source] = {};
+          for (const op of ['bt2390', 'hable', 'reinhard']) {
+            await cmd(page, `set hdr-peak-source ${source} ; set tone-mapping ${op}`);
+            await page.waitForTimeout(80);
+            seen[source][op] = await levels(page);
+          }
+        }
+        const what = `${r} ${tier}: ${JSON.stringify(seen, (_, v) => (typeof v === 'number' ? Math.round(v) : v))}`;
+        for (const op of ['bt2390', 'hable', 'reinhard']) {
+          const [, m100, m203, m400] = seen.measured[op];
+          const [, f100, f203, f400] = seen.fixed[op];
+          const [, , t203, t400] = seen.metadata[op];
+          // Reference white and the scene's own peak are brighter than under the 1000-nit guess ...
+          expect(m203 - f203, what).toBeGreaterThan(10);
+          expect(m400 - f400, what).toBeGreaterThan(4);
+          // ... the peak of the scene is display white, or very near it ...
+          expect(m400, what).toBeGreaterThan(242);
+          // ... and the programme-wide 4000 nits of the metadata leave this scene darker still.
+          expect(f203 - t203, what).toBeGreaterThan(2);
+          expect(f400 - t400, what).toBeGreaterThan(5);
+          // BT.2390 only ever touches what lies above its knee: the mid-tones do not move.
+          if (op === 'bt2390') expect(Math.abs(m100 - f100), what).toBeLessThan(2);
+        }
+        // Drawing the paused picture again changes nothing, whatever was shown in between.
+        await cmd(page, 'set hdr-peak-source measured ; set tone-mapping bt2390');
+        await page.waitForTimeout(80);
+        (await levels(page)).forEach((v, i) =>
+          expect(v, `${r} ${tier} patch ${i} after switching away and back`).toBe(seen.measured.bt2390[i]),
+        );
+        expect((await readPeak(page))!.peak).toBe(m.peak);
+        // The other scene has its own peak: a seek starts the measurement over.
+        await seekPaused(page, HP.cut + 1);
+        const bright = (await readPeak(page))!;
+        expect(bright.peak, `${r} ${tier}: after the seek`).toBeGreaterThan(3600);
+        expect(bright.peak, `${r} ${tier}: after the seek`).toBeLessThan(4400);
+        expectNoErrors(errors);
+      }
+    });
+
+    test(`${r}: the measured peak follows a scene slowly, jumps at a cut, and a picture drawn again stays as it is`, async ({ page }) => {
+      const errors = await openApp(page, { renderer: r, tier: 'wasm' });
+      await load(page, 'hdr_pq_peaks.mkv');
+      await seekPaused(page, 1);
+      // Synthetic BT.2020 PQ pictures straight into the renderer: a grey background, a patch at
+      // SDR white on the left and a small highlight on the right, everything in nits.
+      const out = await page.evaluate(async () => {
+        const pq = (nits: number) => {
+          const y = Math.pow(nits / 10000, 0.1593017578125);
+          return Math.pow((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y), 78.84375);
+        };
+        const W = 128;
+        const H = 64;
+        const make = (pts: number, background: number, highlight: number) => {
+          const code = (nits: number) => Math.round((219 * pq(nits) + 16) * 4);
+          const Y = new Uint16Array(W * H).fill(code(background));
+          const fill = (x0: number, y0: number, w: number, h: number, nits: number) => {
+            for (let y = y0; y < y0 + h; y++) Y.fill(code(nits), y * W + x0, y * W + x0 + w);
+          };
+          fill(8, 16, 32, 32, 203);
+          fill(88, 24, 16, 16, highlight);
+          const C = new Uint16Array((W / 2) * (H / 2)).fill(512);
+          return {
+            kind: 'planar',
+            pts,
+            duration: 1 / 24,
+            width: W,
+            height: H,
+            bitDepth: 10,
+            planes: [new Uint8Array(Y.buffer), new Uint8Array(C.buffer), new Uint8Array(C.slice().buffer)],
+            chromaWidth: W / 2,
+            chromaHeight: H / 2,
+            color: { primaries: 'bt2020', transfer: 'pq', matrix: 'bt2020nc', fullRange: false },
+            rotation: 0,
+          };
+        };
+        const p = window.player as any;
+        const R = p.renderer;
+        const S = {
+          ...p.settings,
+          hdrPeakSource: 'measured',
+          toneMapping: 'bt2390',
+          dither: false,
+          scaler: 'bilinear',
+          sharpen: 0,
+          deband: false,
+        };
+        // The picture as drawn: the level of the SDR-white patch, and a checksum of every pixel.
+        const grab = () => {
+          const c: HTMLCanvasElement = R.snapshot();
+          const ctx = c.getContext('2d')!;
+          const d = ctx.getImageData(0, 0, c.width, c.height).data;
+          let sum = 0;
+          for (let i = 0; i < d.length; i++) sum = (sum * 31 + d[i]) >>> 0;
+          const ref = ctx.getImageData(Math.round((24 / W) * c.width), Math.round(0.5 * c.height), 1, 1).data[1];
+          return { sum, ref };
+        };
+        const peak = async () => (await R.readPeak()).peak as number;
+        const res: Record<string, any> = {};
+
+        // The first picture: all there is to go by.
+        let f = make(100, 100, 400);
+        R.render(f, S);
+        res.first = { peak: await peak(), px: grab() };
+        res.firstAgain = [grab(), grab()];
+        R.render(f, { ...S, hdrPeakSource: 'fixed' });
+        res.firstFixed = grab();
+
+        // The next one has a much brighter highlight, too small to move the average.
+        f = make(100 + 1 / 24, 100, 1000);
+        R.render(f, S);
+        res.second = { peak: await peak(), px: grab() };
+        // Half-way between two states is where drawing again must not move anything.
+        res.secondAgain = [grab(), grab(), grab()];
+        R.render(f, { ...S, hdrPeakSource: 'fixed' });
+        R.render(f, { ...S, toneMapping: 'hable' });
+        R.render(f, S);
+        res.secondBack = { peak: await peak(), px: grab() };
+
+        // Three seconds of the same scene.
+        res.trail = [];
+        for (let i = 2; i <= 73; i++) {
+          f = make(100 + i / 24, 100, 1000);
+          R.render(f, S);
+          if (i % 24 === 1) res.trail.push(await peak());
+        }
+        res.trailEnd = grab();
+        // A cut: the whole picture is another one.
+        f = make(100 + 74 / 24, 1000, 4000);
+        R.render(f, S);
+        res.cut = await peak();
+        // A seek to a picture with much the same average, and a step back from there.
+        f = make(500, 1000, 1500);
+        R.render(f, S);
+        res.seek = await peak();
+        f = make(500 - 1 / 24, 1000, 2500);
+        R.render(f, S);
+        res.back = await peak();
+        return res;
+      });
+      const near = (got: number, want: number, what: string) =>
+        expect(Math.abs(got / want - 1), `${r} ${what}: ${got.toFixed(1)} nits, expected ${want.toFixed(1)}`).toBeLessThan(0.02);
+      const lowPass = (seconds: number) => pqEotf(pqOetf(1000) - (pqOetf(1000) - pqOetf(400)) * Math.exp(-seconds / PEAK_TAU));
+
+      near(out.first.peak, 400, 'first picture');
+      for (const again of out.firstAgain) expect(again, 'the first picture drawn again').toEqual(out.first.px);
+      // Reference white is brighter than under the 1000-nit assumption.
+      expect(out.first.px.ref - out.firstFixed.ref, `${out.first.px.ref} vs ${out.firstFixed.ref}`).toBeGreaterThan(8);
+
+      // One frame later the state has moved a twentieth of the way, in PQ terms: 432 nits, not 1000.
+      near(out.second.peak, lowPass(1 / 24), 'second picture');
+      expect(out.second.peak).toBeGreaterThan(out.first.peak * 1.04);
+      for (const again of out.secondAgain) expect(again, 'the second picture drawn again').toEqual(out.second.px);
+      expect(out.secondBack, 'after other settings and back').toEqual(out.second);
+
+      // After one, two and three seconds: the low-pass with its time constant.
+      expect(out.trail.length).toBe(3);
+      out.trail.forEach((v: number, i: number) => near(v, lowPass((24 * (i + 1) + 1) / 24), `after ${i + 1} s`));
+      expect(out.trail[2]).toBeGreaterThan(940);
+      // The picture follows the state: by now reference white is where a 1000-nit peak puts it.
+      expect(out.first.px.ref - out.trailEnd.ref, `${out.first.px.ref} then ${out.trailEnd.ref}`).toBeGreaterThan(8);
+      expect(Math.abs(out.trailEnd.ref - out.firstFixed.ref)).toBeLessThanOrEqual(2);
+
+      // The cut is taken at once, and so is a seek; neither is smoothed in.
+      near(out.cut, 4000, 'scene cut');
+      near(out.seek, 1500, 'seek');
+      near(out.back, 2500, 'step back');
+      expectNoErrors(errors);
+    });
+
+    test(`${r}: the cut in a real stream is found frame-exactly, stepping and playing`, async ({ page }) => {
+      for (const tier of ['wasm', 'webcodecs'] as const) {
+        const errors = await openApp(page, { renderer: r, tier });
+        await load(page, 'hdr_pq_peaks.mkv');
+        await seekPaused(page, HP.cut - 4 / 30);
+        const seenPeaks: Array<[number, number]> = [];
+        for (let i = 0; i < 8; i++) {
+          const pts: number = await page.evaluate(() => window.player.debug.lastPresentedPts());
+          seenPeaks.push([pts, (await readPeak(page))!.peak]);
+          await cmd(page, 'frame-step');
+          await page.waitForFunction((t) => window.player.debug.lastPresentedPts() > t + 0.01, pts, { timeout: 10_000 });
+        }
+        const what = `${r} ${tier}: ${seenPeaks.map(([t, v]) => `${t.toFixed(3)}s ${v.toFixed(0)}`).join(', ')}`;
+        const before = seenPeaks.filter(([t]) => t < HP.cut - 0.01);
+        const after = seenPeaks.filter(([t]) => t >= HP.cut - 0.01);
+        expect(before.length, what).toBeGreaterThanOrEqual(3);
+        expect(after.length, what).toBeGreaterThanOrEqual(3);
+        for (const [, v] of before) expect(v, what).toBeLessThan(450);
+        // The very first picture of the new scene already has its peak.
+        for (const [, v] of after) expect(v, what).toBeGreaterThan(3600);
+
+        // The same while playing: across the cut, then back.
+        await seekPaused(page, HP.cut - 0.5);
+        expect((await readPeak(page))!.peak).toBeLessThan(450);
+        await page.evaluate(() => window.player.play());
+        await waitForTime(page, HP.cut + 0.4);
+        await page.evaluate(() => window.player.pause());
+        await page.waitForTimeout(150);
+        const played = (await readPeak(page))!.peak;
+        expect(played, `${r} ${tier}: after playing across the cut`).toBeGreaterThan(3600);
+        expect(played).toBeLessThan(4400);
+        expectNoErrors(errors);
+      }
+    });
+
+    test(`${r}: VP9 keeps its HDR metadata in the WebM track header, and it is found on every route`, async ({ page }) => {
+      for (const [tier, mode] of ROUTES) {
+        const errors = await openApp(page, { renderer: r, tier });
+        await load(page, 'hdr_pq_vp9_colour.webm');
+        await cmd(page, 'set dither no ; set hdr-peak-source metadata');
+        await seekPaused(page, 1);
+        const st = await stats(page);
+        expect(st.mode).toBe(mode);
+        expect(st.hdrMetadata, tier).toBe('MaxCLL 4000, MaxFALL 1800, mastering display 0.005–4000 nits');
+        expect(st.hdrPeak, tier).toBe('4000 nits (MaxCLL)');
+        const [l203, l1000, l2000, l4000] = await levels(page);
+        expect(l1000 - l203).toBeGreaterThan(30);
+        expect(l1000, `${r} ${tier}: 1000 nits stays below white`).toBeLessThan(252);
+        expect(l2000 - l1000).toBeGreaterThan(2.5);
+        expect(l4000).toBeGreaterThan(253);
+        expectNoErrors(errors);
+      }
+    });
+  }
+
+  test('a stream without metadata falls back on the fixed value, and the setting is in the Video menu and the overlay', async ({
+    page,
+  }) => {
+    const errors = await openApp(page, { renderer: 'webgpu', tier: 'wasm', skin: 'glass' });
+    await load(page, 'hdr_pq_steps.mkv');
+    await seekPaused(page, 1);
+    await page.mouse.move(640, 640);
+    await page.locator('[data-control="video"]').click();
+    await expect(page.locator('.lp-menu-item[data-checked="true"]', { hasText: 'Measured per scene' })).toBeVisible();
+    await page.locator('.lp-menu-item', { hasText: 'From the stream' }).click();
+    expect((await state(page)).hdrPeakSource).toBe('metadata');
+    await expect(page.locator('.lp-menu-item[data-checked="true"]', { hasText: 'From the stream' })).toBeVisible();
+    // Nothing in this stream: 1000 nits, and the overlay says that it is an assumption.
+    let st = await stats(page);
+    expect(st.hdrMetadata).toBe('');
+    expect(st.hdrPeak).toBe('1000 nits (assumed: the stream states no peak)');
+    await page.locator('.lp-menu-item', { hasText: 'Fixed peak: next value' }).click();
+    expect((await state(page)).hdrPeak).toBe(2000);
+    await page.locator('.lp-menu-item', { hasText: 'Fixed: 2000 nits' }).click();
+    st = await stats(page);
+    expect((await state(page)).hdrPeakSource).toBe('fixed');
+    expect(st.hdrPeak).toBe('2000 nits (fixed)');
+    await page.keyboard.press('Escape');
+    await cmd(page, 'set hdr-peak 99999');
+    expect((await state(page)).hdrPeak, 'clamped to what PQ can code').toBe(10000);
+    await cmd(page, 'set hdr-peak 1000 ; set hdr-peak-source measured');
+    await page.locator('.lp-root').focus();
+    await page.keyboard.press('i');
+    await expect(page.locator('.lp-stats')).toContainText(/HDR peak\s+10\d\d nits \(measured; picture average \d+ nits\)/, {
+      timeout: 5000,
+    });
+    // The Canvas 2D renderer has no tone curve of its own, and so no peak to report.
+    await setRenderer(page, 'canvas2d');
+    await settle(page);
+    expect((await stats(page)).hdrPeak).toBe('');
     expectNoErrors(errors);
   });
 });

@@ -90,7 +90,8 @@ export class MediaWorkerClient {
             planes: m.planes,
             chromaWidth: m.chromaWidth,
             chromaHeight: m.chromaHeight,
-            color: m.color?.transfer && m.color.transfer !== 'unknown' ? m.color : this.color,
+            // The frame's own tags win, but only the probe knows the stream's HDR metadata.
+            color: m.color?.transfer && m.color.transfer !== 'unknown' ? { ...m.color, hdrMetadata: this.color.hdrMetadata } : this.color,
             rotation: this.rotation,
           },
           m.gen,

@@ -66,6 +66,7 @@ The bindings use mpv's `input.conf` syntax and can be edited live: skins menu �
 | `Ctrl+s` | Sharpen strength |
 | `Ctrl+d` | Dithering on / off |
 | `t` | HDR tone-mapping curve |
+| *(Video menu)* | HDR peak, the brightness the tone curve brings down to display white: measured per scene, taken from the stream's metadata (MaxCLL, mastering display), or a fixed number of nits; `set hdr-peak-source measured\|metadata\|fixed`, `set hdr-peak 1000` |
 | *(Video menu)* | Wide gamut to display: compress saturation (keeps hue) or clip; `set gamut-mapping soft\|clip` |
 | `g` | Scale in linear light |
 | `r` | Cycle renderer: WebGPU → WebGL2 → Canvas 2D |
@@ -283,7 +284,7 @@ use Google Chrome. The test runner starts the development server itself.
 | --- | --- |
 | `01-matrix` | Every container × codec clip plays on automatic routing: time advances, the picture is not black, the frame number burned into the pixels matches the audio clock, audio is audible, and every `VideoFrame` and GPU texture is released afterwards. |
 | `02-tiers` | Forced WebCodecs / MSE / FFmpeg-WASM (software decode, stream-copy remux, audio transcode, hybrid audio, multi- and single-threaded core) and native playback each play a clip to the end with no stall; impossible forced routes fail loudly; switching method keeps the position. |
-| `03-renderers` | Switching WebGPU → WebGL2 → Canvas 2D at runtime draws real frames (checked on browser screenshots); colour accuracy against known RGB patches for every ingest path; HDR tone mapping; HDR frames decoded by the browser (WebCodecs, MSE) match software-decoded ones on WebGPU and WebGL2; soft gamut mapping keeps hue and gradation; scalers, deband, sharpening. |
+| `03-renderers` | Switching WebGPU → WebGL2 → Canvas 2D at runtime draws real frames (checked on browser screenshots); colour accuracy against known RGB patches for every ingest path; HDR tone mapping; HDR frames decoded by the browser (WebCodecs, MSE) match software-decoded ones on WebGPU and WebGL2; the HDR peak comes from the stream's static metadata (4000 nits tagged as 4000 are rolled off, not clipped) or is measured per scene (a 400-nit scene is brighter than under a 1000-nit assumption, a cut is followed at once, a paused picture stays as it is), on every decoding method; soft gamut mapping keeps hue and gradation; scalers, deband, sharpening. |
 | `04-sync` | Audio/video sync measured three ways (clock vs. timestamps, pixels vs. clock, beep heard vs. flash seen), 60 fps cadence, pitch-preserving speed changes, 5.1 downmix, gain, A-B loop. |
 | `05-subtitles` | Embedded tracks and fonts are found; ASS events appear on exactly the right frame on all three decoding methods; embedded and user fonts are really used; heavy typesetting keeps up with the display; SRT / WebVTT / PGS; delay and visibility. |
 | `06-ui` | Skin switching during playback with zero console errors; custom and URL-loaded skin packages (layout, tokens, command buttons, sanitising); inspector; key bindings; stats overlay; mouse interaction; plugin API, screenshots, thumbnails, `<lumen-player>`. |
@@ -324,7 +325,9 @@ a deliberately throttled copy of `public/` that the network tests measure agains
 - Embedded text subtitles are read from Matroska (`.mkv`, `.webm`) files only; for other
   containers, load the subtitle file separately.
 - HDR video is tone-mapped to standard dynamic range, by the player's own shaders on every
-  decoding method (with the Canvas 2D renderer, by the browser).
+  decoding method (with the Canvas 2D renderer, by the browser). How bright the source is taken
+  to be is measured per scene by default; the Video menu can switch to the stream's own HDR10
+  metadata or to a fixed value, and the stats overlay shows which peak is in use.
 - If you host media on your own server, make sure it sends video and audio files as they are:
   with a real `Content-Type`, support for range requests, and no gzip/brotli compression. A
   server that compresses a file but answers range requests for it uncompressed can leave the

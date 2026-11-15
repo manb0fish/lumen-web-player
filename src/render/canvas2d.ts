@@ -141,6 +141,12 @@ export class Canvas2DRenderer implements Renderer {
     this.last = null;
   }
 
+  async readPeak(): Promise<null> {
+    return null; // no tone mapping of its own, so no peak
+  }
+
+  refreshStats(): void {}
+
   destroy(): void {
     if (this.destroyed) return;
     this.destroyed = true;

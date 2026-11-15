@@ -14,12 +14,13 @@
 //   - testsrc2 underneath (motion, colour, fine detail).
 
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, statSync, writeFileSync, copyFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, copyFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { fontAss, srt, syncAss, tortureAss, vtt } from './gen-ass.mjs';
 import { buildSup, PGS_ITEMS } from './gen-pgs.mjs';
+import { addMatroskaHdrMetadata } from './mkv-hdr.mjs';
 
 const require = createRequire(import.meta.url);
 const FFMPEG = process.env.FFMPEG_PATH || require('ffmpeg-static');
@@ -77,9 +78,10 @@ const TAG709 = ['-colorspace', 'bt709', '-color_primaries', 'bt709', '-color_trc
 const D = 8; // seconds, standard clip length
 const av = (fps = 30, d = D) => ['-f', 'lavfi', '-i', pattern(fps, d), '-f', 'lavfi', '-i', beep(d)];
 
-/** @type {Array<{file:string, args:string[], meta:object, deps?:string[]}>} */
+/** @type {Array<{file:string, args:string[], meta:object, deps?:string[], post?:(buf:Buffer)=>Buffer}>} */
 const jobs = [];
-const add = (file, args, meta, deps) => jobs.push({ file, args, meta, deps });
+/** `post` rewrites the finished file (what ffmpeg cannot be told to write). */
+const add = (file, args, meta, deps, post) => jobs.push({ file, args, meta, deps, post });
 
 // ---- containers x codecs ------------------------------------------------------------------------
 add(
@@ -467,14 +469,18 @@ function pqCode(nits) {
   const y = Math.pow(nits / 10000, m1);
   return Math.round(255 * Math.pow((c1 + c2 * y) / (1 + c3 * y), m2));
 }
-function pqSteps(duration, fps = 30) {
+/** Four grey patches of the given luminances (nits), as R'G'B' PQ; `tag` keeps the pad names of several apart. */
+function pqQuad(s, duration, fps = 30, tag = '') {
   const src = (nits) => {
     const v = pqCode(nits);
     return `color=c=${hex([v, v, v])}:s=320x180:r=${fps}:d=${duration},format=gbrp`;
   };
-  const s = HDR_STEPS;
-  return `${src(s.topLeft)}[a];${src(s.topRight)}[b];${src(s.bottomLeft)}[c];${src(s.bottomRight)}[d];[a][b]hstack[t];[c][d]hstack[u];[t][u]vstack,scale=out_color_matrix=bt2020:out_range=tv,format=yuv420p10le`;
+  const pad = (n) => `[${n}${tag}]`;
+  return `${src(s.topLeft)}${pad('a')};${src(s.topRight)}${pad('b')};${src(s.bottomLeft)}${pad('c')};${src(s.bottomRight)}${pad('d')};${pad('a')}${pad('b')}hstack${pad('t')};${pad('c')}${pad('d')}hstack${pad('u')};${pad('t')}${pad('u')}vstack`;
 }
+const PQ_YUV = 'scale=out_color_matrix=bt2020:out_range=tv,format=yuv420p10le';
+const pqSteps = (duration, fps = 30) => `${pqQuad(HDR_STEPS, duration, fps)},${PQ_YUV}`;
+const TAG_PQ = ['-colorspace', 'bt2020nc', '-color_primaries', 'bt2020', '-color_trc', 'smpte2084', '-color_range', 'tv'];
 add(
   'hdr_pq_steps.mkv',
   [
@@ -503,6 +509,72 @@ add(
     'aac',
   ],
   { container: 'mkv', video: 'hevc', audio: 'aac', bitDepth: 10, fps: 30, duration: 4, hdr: 'pq', colors: true, steps: true },
+);
+
+// HDR10 with static metadata, and a peak that changes. Two scenes of two seconds: one that never
+// passes 400 nits, then, after a hard cut, one that reaches 4000. The stream says it was mastered
+// on a 4000-nit display and gives MaxCLL / MaxFALL (x265 writes them as SEI messages 137 and 144).
+export const HDR_PEAKS = {
+  cut: 2,
+  dim: { topLeft: 50, topRight: 100, bottomLeft: 203, bottomRight: 400 },
+  bright: { topLeft: 203, topRight: 1000, bottomLeft: 2000, bottomRight: 4000 },
+  maxCll: 4000,
+  maxFall: 1800,
+  masteringMax: 4000,
+  masteringMin: 0.005,
+};
+const HP = HDR_PEAKS;
+// x265 wants the mastering display in units of 0.00002 (chromaticity) and 0.0001 nits (luminance).
+const MASTER_DISPLAY = `G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(${HP.masteringMax * 10000},${HP.masteringMin * 10000})`;
+add(
+  'hdr_pq_peaks.mkv',
+  [
+    '-f',
+    'lavfi',
+    '-i',
+    `${pqQuad(HP.dim, HP.cut, 30, '1')}[s1];${pqQuad(HP.bright, HP.cut, 30, '2')}[s2];[s1][s2]concat=n=2:v=1:a=0,${PQ_YUV}`,
+    '-f',
+    'lavfi',
+    '-i',
+    beep(2 * HP.cut),
+    ...X265.slice(0, 6),
+    '-x265-params',
+    `log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:master-display=${MASTER_DISPLAY}:max-cll=${HP.maxCll},${HP.maxFall}`,
+    '-g',
+    '30',
+    ...TAG_PQ,
+    '-c:a',
+    'aac',
+  ],
+  { container: 'mkv', video: 'hevc', audio: 'aac', bitDepth: 10, fps: 30, duration: 2 * HP.cut, hdr: 'pq', colors: true, hdr10: 'sei' },
+);
+// The bright scene as VP9, which has no place for such metadata in its bitstream: it goes into the
+// track header (the Colour element), where ffmpeg does not write it, so the file is edited afterwards.
+add(
+  'hdr_pq_vp9_colour.webm',
+  [
+    '-f',
+    'lavfi',
+    '-i',
+    `${pqQuad(HP.bright, HP.cut)},${PQ_YUV}`,
+    '-f',
+    'lavfi',
+    '-i',
+    beep(HP.cut),
+    ...VP9,
+    '-profile:v',
+    '2',
+    '-g',
+    '30',
+    ...TAG_PQ,
+    '-c:a',
+    'libopus',
+    '-b:a',
+    '96k',
+  ],
+  { container: 'webm', video: 'vp9', audio: 'opus', bitDepth: 10, fps: 30, duration: HP.cut, hdr: 'pq', colors: true, hdr10: 'container' },
+  undefined,
+  (file) => addMatroskaHdrMetadata(file, HP),
 );
 
 // ---- subtitles ----------------------------------------------------------------------------------
@@ -637,7 +709,15 @@ function run(job) {
     let err = '';
     p.stderr.on('data', (d) => (err += d));
     p.on('error', rej);
-    p.on('close', (code) => (code === 0 ? res('built') : rej(new Error(`${job.file}: ffmpeg exited ${code}\n${err.slice(-1500)}`))));
+    p.on('close', (code) => {
+      if (code !== 0) return rej(new Error(`${job.file}: ffmpeg exited ${code}\n${err.slice(-1500)}`));
+      try {
+        if (job.post) writeFileSync(out, job.post(readFileSync(out)));
+        res('built');
+      } catch (e) {
+        rej(new Error(`${job.file}: ${e.message}`));
+      }
+    });
   });
 }
 
@@ -672,6 +752,7 @@ const manifest = {
   flash: { x: (W - 112) / W, y: (H - 112) / H, w: 96 / W, h: 96 / H, period: 1, on: 0.1 },
   colorPatches: COLOR_PATCHES,
   hdrSteps: HDR_STEPS,
+  hdrPeaks: HDR_PEAKS,
   sync: { boxes: sync.boxes },
   font: { family: FONT_FAMILY, file: 'DejaVuSansMono-Bold.ttf', line: font.line },
   pgs: PGS_ITEMS.map((i) => ({

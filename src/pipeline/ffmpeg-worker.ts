@@ -20,6 +20,7 @@
 import type { AudioTrackInfo, ColorInfo, MediaInfo, VideoTrackInfo } from '../core/types';
 import { BlockCache, IO_BLOCK, createReader, probeUrl, syncFill, waitForBlock, type ReadFn } from './ffmpeg-io';
 import { CTRL_CLOCK_MS, CTRL_GEN, CTRL_MSE_GATE, CTRL_RELEASED } from './ffmpeg-shared';
+import { ffprobeHdrMetadata, hdrMetadataComplete, mergeHdrMetadata } from './hdr-metadata';
 
 const post = (msg: any, transfer: Transferable[] = []) => (self as any).postMessage(msg, transfer);
 
@@ -579,6 +580,41 @@ function canSoftwareDecode(codecName: string | undefined): boolean {
 
 const CODEC_ALIAS: Record<string, string> = { h264: 'avc', hevc: 'hevc', vp9: 'vp9', av1: 'av1', vp8: 'vp8', dts: 'dts' };
 
+/**
+ * Side data of the first decoded frame of one stream: where HDR metadata that exists only as SEI
+ * messages or metadata OBUs becomes visible. Reads one packet and decodes it.
+ */
+function firstFrameSideData(streamIndex: number): unknown {
+  try {
+    FS.unlink('/tmp/frame.json');
+  } catch {
+    /* none */
+  }
+  try {
+    core.ffprobe(
+      '-v',
+      'error',
+      '-print_format',
+      'json',
+      '-select_streams',
+      String(streamIndex),
+      '-read_intervals',
+      '%+#1',
+      '-show_frames',
+      '-show_entries',
+      'frame=side_data_list',
+      inputPath,
+      '-o',
+      '/tmp/frame.json',
+    );
+    core.reset?.();
+    const frames: any[] = JSON.parse(FS.readFile('/tmp/frame.json', { encoding: 'utf8' })).frames ?? [];
+    return frames.find((f) => Array.isArray(f.side_data_list))?.side_data_list ?? null;
+  } catch {
+    return null; // no decoder for this codec in the core, or nothing decodable in the first packet
+  }
+}
+
 function probe(m: any): void {
   try {
     FS.unlink('/tmp/probe.json');
@@ -586,7 +622,21 @@ function probe(m: any): void {
     /* none */
   }
   logTail = [];
-  core.ffprobe('-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', inputPath, '-o', '/tmp/probe.json');
+  // ffprobe's options outlive a run in this core (they are C globals), and firstFrameSideData()
+  // below narrows the stream selection: say here that all streams are wanted.
+  core.ffprobe(
+    '-v',
+    'error',
+    '-print_format',
+    'json',
+    '-select_streams',
+    '',
+    '-show_format',
+    '-show_streams',
+    inputPath,
+    '-o',
+    '/tmp/probe.json',
+  );
   core.reset?.();
   let json: any;
   try {
@@ -611,6 +661,13 @@ function probe(m: any): void {
       if (typeof sd.rotation === 'number') rotation = ((-sd.rotation % 360) + 360) % 360;
     }
     const color = mapColor(vs);
+    if (color.transfer === 'pq' || color.transfer === 'hlg') {
+      // Stream side data is what the container says (Matroska Colour, MP4 mdcv / clli). HEVC and
+      // AV1 usually say it in the bitstream only, which shows as side data of the decoded frame.
+      let meta = ffprobeHdrMetadata(vs.side_data_list);
+      if (!hdrMetadataComplete(meta)) meta = mergeHdrMetadata(meta, ffprobeHdrMetadata(firstFrameSideData(vs.index)));
+      if (meta) color.hdrMetadata = meta;
+    }
     const fps = ratio(vs.avg_frame_rate) || ratio(vs.r_frame_rate) || 30;
     const swap = rotation === 90 || rotation === 270;
     video = {

@@ -25,11 +25,28 @@ export type Primaries = 'bt709' | 'bt601' | 'bt2020' | 'p3' | 'unknown';
 export type Transfer = 'bt709' | 'srgb' | 'pq' | 'hlg' | 'linear' | 'unknown';
 export type Matrix = 'bt709' | 'bt601' | 'bt2020nc' | 'rgb' | 'unknown';
 
+/**
+ * Static HDR10 metadata, in nits: the luminance range of the mastering display (SMPTE ST 2086) and
+ * the content light levels (CTA-861.3). A field that the stream does not state is absent.
+ */
+export interface HdrMetadata {
+  /** MaxCLL: the brightest pixel of the whole programme. */
+  maxCll?: number;
+  /** MaxFALL: the highest frame-average light level. */
+  maxFall?: number;
+  /** Peak luminance of the mastering display. */
+  masteringMax?: number;
+  /** Black level of the mastering display. */
+  masteringMin?: number;
+}
+
 export interface ColorInfo {
   primaries: Primaries;
   transfer: Transfer;
   matrix: Matrix;
   fullRange: boolean;
+  /** Present when the stream or its container carries static HDR metadata. */
+  hdrMetadata?: HdrMetadata;
 }
 
 export const DEFAULT_COLOR: ColorInfo = { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false };
@@ -123,6 +140,11 @@ export type Scaler = 'bilinear' | 'bicubic' | 'lanczos' | 'fsr';
 export type ToneMap = 'bt2390' | 'hable' | 'reinhard' | 'clip';
 /** Colours the display cannot show: compress saturation towards grey (keeps hue), or cut each channel off. */
 export type GamutMap = 'soft' | 'clip';
+/**
+ * Where the tone curve takes the brightness of the source from: measured per scene on the GPU, the
+ * stream's static HDR10 metadata, or a fixed number of nits.
+ */
+export type PeakSource = 'measured' | 'metadata' | 'fixed';
 
 export interface RenderSettings {
   scaler: Scaler;
@@ -134,7 +156,13 @@ export interface RenderSettings {
   dither: boolean;
   /** Scale in linear light instead of gamma light. */
   linearScaling: boolean;
-  /** Assumed mastering peak for HDR sources, in nits. */
+  /**
+   * Source of the HDR peak. Each falls back on the next when it has nothing to offer: 'measured'
+   * needs a renderer that can measure (float render targets), 'metadata' a stream that states
+   * MaxCLL or a mastering peak.
+   */
+  hdrPeakSource: PeakSource;
+  /** Peak in nits for 'fixed', and the last resort of the other two. */
   hdrPeak: number;
   /**
    * Colour-manage HDR frames that the browser decoded (VideoFrame, <video>) in our shaders, like
@@ -151,6 +179,7 @@ export const DEFAULT_RENDER_SETTINGS: RenderSettings = {
   gamutMapping: 'soft',
   dither: true,
   linearScaling: false,
+  hdrPeakSource: 'measured',
   hdrPeak: 1000,
   externalHdr: true,
 };
@@ -192,6 +221,9 @@ export interface PlayerState {
   sharpen: number;
   toneMapping: ToneMap;
   gamutMapping: GamutMap;
+  hdrPeakSource: PeakSource;
+  /** Nits; used by the 'fixed' peak source and when the others have nothing. */
+  hdrPeak: number;
   dither: boolean;
   linearScaling: boolean;
   normalize: boolean;

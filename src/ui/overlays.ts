@@ -61,6 +61,8 @@ export function formatStats(s: PlayerStats): string {
   out += row('Renderer', `${s.renderer ?? '-'}  —  ${s.rendererDetail}`);
   out += row('Shader chain', s.chain);
   if (s.hdrHandover) out += row('HDR samples', s.hdrHandover);
+  if (s.hdrPeak) out += row('HDR peak', s.hdrPeak);
+  if (s.hdrMetadata) out += row('HDR metadata', s.hdrMetadata);
   out += row('Container', s.container);
   out += row('Video', s.video);
   out += row('Audio', s.audio);

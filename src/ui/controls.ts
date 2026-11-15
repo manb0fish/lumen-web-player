@@ -632,6 +632,25 @@ function videoItems(ctx: ControlContext): MenuItem[] {
       onSelect: () => run(ctx, `set tone-mapping ${v}`),
     });
   }
+  items.push({ type: 'header', label: 'HDR peak' });
+  for (const [v, label] of [
+    ['measured', 'Measured per scene'],
+    ['metadata', 'From the stream (MaxCLL, mastering display)'],
+    ['fixed', `Fixed: ${Math.round(s.hdrPeak)} nits`],
+  ]) {
+    items.push({
+      label,
+      checked: s.hdrPeakSource === v,
+      keepOpen: true,
+      onSelect: () => run(ctx, `set hdr-peak-source ${v}`),
+    });
+  }
+  items.push({
+    label: 'Fixed peak: next value',
+    hint: `${Math.round(s.hdrPeak)} nits`,
+    keepOpen: true,
+    onSelect: () => run(ctx, 'cycle-values hdr-peak 1000 2000 4000 10000 400 600'),
+  });
   items.push({ type: 'header', label: 'Wide gamut to display' });
   for (const [v, label] of [
     ['soft', 'Compress saturation (keeps hue)'],
