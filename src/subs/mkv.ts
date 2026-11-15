@@ -104,7 +104,7 @@ class BlobReader {
   }
 }
 
-function readId(b: Uint8Array, o: number): { id: number; len: number } | null {
+export function readId(b: Uint8Array, o: number): { id: number; len: number } | null {
   if (o >= b.length) return null;
   const first = b[o];
   let len = 1;
@@ -119,7 +119,7 @@ function readId(b: Uint8Array, o: number): { id: number; len: number } | null {
   return { id, len };
 }
 
-function readSize(b: Uint8Array, o: number): { size: number; len: number } | null {
+export function readSize(b: Uint8Array, o: number): { size: number; len: number } | null {
   if (o >= b.length) return null;
   const first = b[o];
   let len = 1;

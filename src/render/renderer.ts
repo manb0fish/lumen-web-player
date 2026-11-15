@@ -9,6 +9,8 @@ export interface RendererStats {
   chain: string;
   /** How HDR frames decoded by the browser are being read (empty when none have been shown). */
   hdrHandover: string;
+  /** The peak the HDR frame on screen was tone-mapped with, and where it came from (empty: no such frame). */
+  hdrPeak: string;
 }
 
 /**
@@ -31,6 +33,14 @@ export interface Renderer {
   snapshot(): HTMLCanvasElement | null;
   /** Drop the reference to the last frame (the owner is about to close it). */
   forget(): void;
+  /**
+   * The measured HDR peak and picture average now in use, in nits, read back from the GPU. Null
+   * when the frame on screen is not tone-mapped with a measured peak. For the stats overlay and
+   * the tests: rendering itself never reads it back.
+   */
+  readPeak(): Promise<{ peak: number; mean: number } | null>;
+  /** Bring `stats` up to date with what only the GPU knows. Asynchronous: a later look has it. */
+  refreshStats(): void;
   destroy(): void;
 }
 
@@ -48,7 +58,7 @@ export function countTexture(stats: RendererStats, delta: 1 | -1): void {
 }
 
 export function newStats(): RendererStats {
-  return { texturesCreated: 0, texturesDestroyed: 0, framesRendered: 0, lastRenderMs: 0, chain: 'idle', hdrHandover: '' };
+  return { texturesCreated: 0, texturesDestroyed: 0, framesRendered: 0, lastRenderMs: 0, chain: 'idle', hdrHandover: '', hdrPeak: '' };
 }
 
 export function makeCanvas(): HTMLCanvasElement {

@@ -4,8 +4,10 @@ import {
   type ExternalPacking,
   frameDisplaySize,
   gamutMapCode,
+  isHdrTransfer,
   kernelCode,
   packingCode,
+  pqEotf,
   primariesCode,
   rotationCode,
   toneMapCode,
@@ -13,8 +15,30 @@ import {
   yuvUniforms,
 } from './color';
 import { classifyExternal, ExternalHdrTracker, halfToFloat, PROBE_SIZE, PROBE_TILE, probeOrigins, sampleBrowserSdr } from './external-hdr';
+import {
+  choosePeak,
+  describeMeasuredPeak,
+  PEAK_GRID,
+  PEAK_SCENE_HIGH,
+  PEAK_SCENE_LOW,
+  peakKey,
+  type PeakStep,
+  peakTaps,
+  PeakTracker,
+} from './peak';
 import { copyCanvas, countTexture, makeCanvas, newStats, type Renderer, type RendererStats } from './renderer';
-import { WGSL_DEBAND, WGSL_EASU, WGSL_FINAL, WGSL_INGEST_EXTERNAL, WGSL_INGEST_PLANAR, WGSL_PROBE_EXTERNAL, WGSL_SCALE } from './wgsl';
+import {
+  WGSL_DEBAND,
+  WGSL_EASU,
+  WGSL_FINAL,
+  WGSL_INGEST_EXTERNAL,
+  WGSL_INGEST_PLANAR,
+  WGSL_MEASURE_EXTERNAL,
+  WGSL_MEASURE_PLANAR,
+  WGSL_PEAK_REDUCE,
+  WGSL_PROBE_EXTERNAL,
+  WGSL_SCALE,
+} from './wgsl';
 
 interface Target {
   tex: GPUTexture;
@@ -32,6 +56,8 @@ interface Plane {
 }
 
 const INTERMEDIATE: GPUTextureFormat = 'rgba16float';
+/** The measured peak is a running average: full floats, or its small steps would be rounded away. */
+const PEAK_STATE: GPUTextureFormat = 'rgba32float';
 
 /**
  * WebGPU renderer.
@@ -40,6 +66,8 @@ const INTERMEDIATE: GPUTextureFormat = 'rgba16float';
  *    colour-manages itself (external-hdr.ts explains, and checks, what was handed over).
  *  - Software-decoded pictures are uploaded as three planes (R8 for 8-bit, RG8-packed LE16 for
  *    10/12-bit) and converted by our own shader: range, matrix, PQ/HLG EOTF, tone map, gamut.
+ *  - The peak an HDR picture is tone-mapped with can be measured on the GPU (peak.ts): two small
+ *    passes ahead of the ingest, whose result the ingest shader reads from a 1x1 texture.
  *  - Optional deband, bicubic / Lanczos-3 / EASU scaling, RCAS sharpening and dithering.
  */
 export class WebGPURenderer implements Renderer {
@@ -60,6 +88,18 @@ export class WebGPURenderer implements Renderer {
   private pEasu!: GPURenderPipeline;
   private pFinal!: GPURenderPipeline;
   private pProbe!: GPURenderPipeline;
+  private pMeasureExt!: GPURenderPipeline;
+  private pMeasurePlanar!: GPURenderPipeline;
+  private pReduce!: GPURenderPipeline;
+  private uReduce!: GPUBuffer;
+  private peakGrid: Target | null = null;
+  /** Ping-pong: the reduce pass reads the state of the previous picture and writes the other one. */
+  private peakState: Target[] = [];
+  private peakCur = 0;
+  private peak = new PeakTracker();
+  /** The frame on the canvas was tone-mapped with the measured peak. */
+  private peakLive = false;
+  private peakReading = false;
   private uProbe!: GPUBuffer;
   private probeTex: GPUTexture | null = null;
   private probeBuf: GPUBuffer | null = null;
@@ -93,7 +133,7 @@ export class WebGPURenderer implements Renderer {
     this.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
 
     device.pushErrorScope('validation');
-    const [pExt, pPlanar, pDeband, pScale, pEasu, pFinal, pProbe] = await Promise.all([
+    const [pExt, pPlanar, pDeband, pScale, pEasu, pFinal, pProbe, pMeasureExt, pMeasurePlanar, pReduce] = await Promise.all([
       this.pipeline('ingest-external', WGSL_INGEST_EXTERNAL, INTERMEDIATE),
       this.pipeline('ingest-planar', WGSL_INGEST_PLANAR, INTERMEDIATE),
       this.pipeline('deband', WGSL_DEBAND, INTERMEDIATE),
@@ -101,6 +141,9 @@ export class WebGPURenderer implements Renderer {
       this.pipeline('easu', WGSL_EASU, INTERMEDIATE),
       this.pipeline('final', WGSL_FINAL, this.format),
       this.pipeline('probe-external', WGSL_PROBE_EXTERNAL, INTERMEDIATE),
+      this.pipeline('measure-external', WGSL_MEASURE_EXTERNAL, INTERMEDIATE),
+      this.pipeline('measure-planar', WGSL_MEASURE_PLANAR, INTERMEDIATE),
+      this.pipeline('peak-reduce', WGSL_PEAK_REDUCE, PEAK_STATE),
     ]);
     const err = await device.popErrorScope();
     if (err) throw new Error(`WebGPU pipeline validation failed: ${err.message}`);
@@ -111,14 +154,21 @@ export class WebGPURenderer implements Renderer {
     this.pEasu = pEasu;
     this.pFinal = pFinal;
     this.pProbe = pProbe;
+    this.pMeasureExt = pMeasureExt;
+    this.pMeasurePlanar = pMeasurePlanar;
+    this.pReduce = pReduce;
 
     const ubuf = (size: number) => device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.uExt = ubuf(48);
     this.uProbe = ubuf(48);
-    this.uPlanar = ubuf(112);
+    this.uPlanar = ubuf(128);
+    this.uReduce = ubuf(16);
     this.uDeband = ubuf(16);
     this.uScale = ubuf(32);
     this.uFinal = ubuf(16);
+    // The ingest shaders name the state, so it exists from the start; the grid comes with the
+    // first picture that is measured.
+    this.peakState = [this.fixedTarget('peak-state-0', 1, PEAK_STATE), this.fixedTarget('peak-state-1', 1, PEAK_STATE)];
 
     device.lost.then((info) => {
       if (!this.destroyed) this.onLost?.(info.message || String(info.reason));
@@ -168,6 +218,39 @@ export class WebGPURenderer implements Renderer {
     const t = { tex, view: tex.createView(), w, h };
     this.targets[key] = t;
     return t;
+  }
+
+  private fixedTarget(label: string, size: number, format: GPUTextureFormat): Target {
+    const tex = this.device.createTexture({
+      label,
+      size: { width: size, height: size },
+      format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+    });
+    countTexture(this.stats, 1);
+    return { tex, view: tex.createView(), w: size, h: size };
+  }
+
+  /**
+   * The two passes that measure a new picture (peak.ts). `source` binds the frame as the ingest
+   * pass will see it. Afterwards peakState[peakCur] is the state to tone-map this picture with.
+   */
+  private measurePeak(encoder: GPUCommandEncoder, pipeline: GPURenderPipeline, source: GPUBindGroupEntry[], step: PeakStep): void {
+    const device = this.device;
+    const grid = (this.peakGrid ??= this.fixedTarget('peak-grid', PEAK_GRID, INTERMEDIATE));
+    this.pass(encoder, pipeline, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: source }), grid.view);
+    const prev = this.peakCur;
+    this.peakCur ^= 1;
+    device.queue.writeBuffer(this.uReduce, 0, new Float32Array([step.reset ? 1 : 0, step.alpha, PEAK_SCENE_LOW, PEAK_SCENE_HIGH]));
+    const bind = device.createBindGroup({
+      layout: this.pReduce.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.uReduce } },
+        { binding: 1, resource: grid.view },
+        { binding: 2, resource: this.peakState[prev].view },
+      ],
+    });
+    this.pass(encoder, this.pReduce, bind, this.peakState[this.peakCur].view);
   }
 
   private plane(i: number, w: number, h: number, format: GPUTextureFormat): Plane {
@@ -248,29 +331,39 @@ export class WebGPURenderer implements Renderer {
     const encoder = device.createCommandEncoder();
     let packing: ExternalPacking = 'converted';
     let afterSubmit: (() => void) | null = null;
+    let peakDetail = '';
+    let measured = false;
+    const taps = peakTaps(frame.width, frame.height);
 
     // ---- pass 1: ingest -> A -------------------------------------------------------------
     if (frame.kind === 'planar') {
       const [py, pu, pv] = this.uploadPlanar(frame);
       const yuv = yuvUniforms(frame.color, frame.bitDepth, frame.height);
-      const buf = new ArrayBuffer(112);
-      const f = new Float32Array(buf, 0, 24);
+      const peak = isHdrTransfer(frame.color) ? choosePeak(frame.color, settings, true) : null;
+      measured = peak?.source === 'measured';
+      peakDetail = peak?.detail ?? '';
+      const buf = new ArrayBuffer(128);
+      const f = new Float32Array(buf, 0, 28);
       const m = yuv.matrix;
       f.set([m[0], m[1], m[2], 0, m[3], m[4], m[5], 0, m[6], m[7], m[8], 0], 0);
       f.set([yuv.offset[0], yuv.offset[1], yuv.offset[2], 0], 12);
       f.set([yuv.scale[0], yuv.scale[1], yuv.scale[2], 0], 16);
-      f.set([yuv.pack[0], yuv.pack[1], settings.hdrPeak, gamutMapCode(settings.gamutMapping)], 20);
-      new Uint32Array(buf, 96, 4).set([transferCode(frame.color), primariesCode(frame.color), toneMapCode(settings.toneMapping), rot]);
+      f.set([yuv.pack[0], yuv.pack[1], peak?.nits ?? settings.hdrPeak, gamutMapCode(settings.gamutMapping)], 20);
+      f.set([measured ? 1 : 0, taps[0], taps[1], 0], 24);
+      new Uint32Array(buf, 112, 4).set([transferCode(frame.color), primariesCode(frame.color), toneMapCode(settings.toneMapping), rot]);
       device.queue.writeBuffer(this.uPlanar, 0, buf);
+      const source: GPUBindGroupEntry[] = [
+        { binding: 0, resource: { buffer: this.uPlanar } },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: py.view },
+        { binding: 3, resource: pu.view },
+        { binding: 4, resource: pv.view },
+      ];
+      const step = measured ? this.peak.step(frame, peakKey(frame, '')) : null;
+      if (step) this.measurePeak(encoder, this.pMeasurePlanar, source, step);
       const bind = device.createBindGroup({
         layout: this.pPlanar.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.uPlanar } },
-          { binding: 1, resource: this.sampler },
-          { binding: 2, resource: py.view },
-          { binding: 3, resource: pu.view },
-          { binding: 4, resource: pv.view },
-        ],
+        entries: [...source, { binding: 5, resource: this.peakState[this.peakCur].view }],
       });
       this.pass(encoder, this.pPlanar, bind, A.view);
     } else {
@@ -282,6 +375,10 @@ export class WebGPURenderer implements Renderer {
         return; // source not ready (e.g. <video> without a decoded frame yet)
       }
       packing = settings.externalHdr ? this.extHdr.packingFor(frame) : 'converted';
+      // Only samples that go through our tone curve have a peak to speak of.
+      const peak = packing !== 'converted' && isHdrTransfer(frame.color) ? choosePeak(frame.color, settings, true) : null;
+      measured = peak?.source === 'measured';
+      peakDetail = peak?.detail ?? '';
       const buf = new ArrayBuffer(48);
       new Uint32Array(buf, 0, 8).set([
         packingCode(packing),
@@ -290,16 +387,20 @@ export class WebGPURenderer implements Renderer {
         rot,
         toneMapCode(settings.toneMapping),
         gamutMapCode(settings.gamutMapping),
+        measured ? 1 : 0,
       ]);
-      new Float32Array(buf, 32, 4).set([settings.hdrPeak]);
+      new Float32Array(buf, 32, 4).set([peak?.nits ?? settings.hdrPeak, taps[0], taps[1]]);
       device.queue.writeBuffer(this.uExt, 0, buf);
+      const from: GPUBindGroupEntry[] = [
+        { binding: 0, resource: { buffer: this.uExt } },
+        { binding: 1, resource: this.sampler },
+        { binding: 2, resource: ext },
+      ];
+      const step = measured ? this.peak.step(frame, peakKey(frame, packing)) : null;
+      if (step) this.measurePeak(encoder, this.pMeasureExt, from, step);
       const bind = device.createBindGroup({
         layout: this.pExt.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.uExt } },
-          { binding: 1, resource: this.sampler },
-          { binding: 2, resource: ext },
-        ],
+        entries: [...from, { binding: 3, resource: this.peakState[this.peakCur].view }],
       });
       this.pass(encoder, this.pExt, bind, A.view);
       if (settings.externalHdr && this.extHdr.wantsProbe(frame, t0)) afterSubmit = this.probe(encoder, ext, source, frame, t0);
@@ -336,6 +437,7 @@ export class WebGPURenderer implements Renderer {
     try {
       view = this.ctx.getCurrentTexture().createView();
     } catch {
+      this.peak.reset(); // the measuring passes of this frame are not going to run
       return;
     }
     this.pass(encoder, this.pFinal, this.texBind(this.pFinal, this.uFinal, cur.view), view);
@@ -347,7 +449,37 @@ export class WebGPURenderer implements Renderer {
     this.stats.lastRenderMs = performance.now() - t0;
     this.stats.chain = describeChain(frame, settings, outW, outH, packing);
     if (frame.kind !== 'planar' && packing !== 'converted') this.stats.hdrHandover = this.extHdr.detail;
+    // A measured peak is known to the GPU only: refreshStats() fills in its text.
+    if (!measured || !this.peakLive) this.stats.hdrPeak = peakDetail;
+    this.peakLive = measured;
     this.probeLater(frame, settings);
+  }
+
+  async readPeak(): Promise<{ peak: number; mean: number } | null> {
+    if (this.destroyed || !this.peakLive) return null;
+    const device = this.device;
+    const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    try {
+      const encoder = device.createCommandEncoder();
+      encoder.copyTextureToBuffer({ texture: this.peakState[this.peakCur].tex }, { buffer: buf }, { width: 1, height: 1 });
+      device.queue.submit([encoder.finish()]);
+      await buf.mapAsync(GPUMapMode.READ);
+      const state = new Float32Array(buf.getMappedRange().slice(0));
+      return { peak: pqEotf(state[0]), mean: pqEotf(state[1]) };
+    } catch {
+      return null;
+    } finally {
+      buf.destroy();
+    }
+  }
+
+  refreshStats(): void {
+    if (this.peakReading || !this.peakLive) return;
+    this.peakReading = true;
+    void this.readPeak().then((v) => {
+      this.peakReading = false;
+      if (v && this.peakLive && !this.destroyed) this.stats.hdrPeak = describeMeasuredPeak(v.peak, v.mean);
+    });
   }
 
   /** A paused player draws nothing new: come back by ourselves while a frame is still unchecked. */
@@ -444,6 +576,7 @@ export class WebGPURenderer implements Renderer {
   forget(): void {
     this.last = null;
     this.extHdr.reset();
+    this.peak.reset();
   }
 
   destroy(): void {
@@ -467,6 +600,14 @@ export class WebGPURenderer implements Renderer {
       }
     }
     clearTimeout(this.probeTimer);
+    for (const t of [this.peakGrid, ...this.peakState]) {
+      if (t) {
+        t.tex.destroy();
+        countTexture(this.stats, -1);
+      }
+    }
+    this.peakGrid = null;
+    this.peakState = [];
     if (this.probeTex) {
       this.probeTex.destroy();
       countTexture(this.stats, -1);
@@ -477,6 +618,7 @@ export class WebGPURenderer implements Renderer {
       this.uProbe?.destroy();
       this.uExt?.destroy();
       this.uPlanar?.destroy();
+      this.uReduce?.destroy();
       this.uDeband?.destroy();
       this.uScale?.destroy();
       this.uFinal?.destroy();

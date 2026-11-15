@@ -67,7 +67,8 @@ were made along the way.
 | `src/pipeline/frame-pipeline.ts` | A/V sync engine for frame-push tiers. |
 | `src/pipeline/element-pipeline.ts` | `<video>`-based pipeline (MSE fed by mediabunny or FFmpeg; native `src`). |
 | `src/audio/worklet.js`, `engine.ts` | AudioWorklet processors and the Web Audio graph / clock facade. |
-| `src/render/*` | Renderer interface, WebGPU (`wgsl.ts`), WebGL2 (`glsl.ts`), Canvas 2D, shared colour math. |
+| `src/pipeline/hdr-metadata.ts` | Static HDR10 metadata out of SEI messages, AV1 metadata OBUs, the Matroska `Colour` element and ffprobe side data. |
+| `src/render/*` | Renderer interface, WebGPU (`wgsl.ts`), WebGL2 (`glsl.ts`), Canvas 2D, shared colour math, the HDR peak (`peak.ts`). |
 | `src/subs/*` | Subtitle manager (JASSUB), Matroska scanner, SRT/VTT conversion, PGS decoder. |
 | `src/ui/*` | Skin engine, control registry, menus, overlays, three built-in skins. |
 | `src/element.ts` | `<lumen-player>` custom element. |
@@ -211,8 +212,10 @@ ingest ──► [deband] ──► [scale: bicubic | Lanczos-3 | EASU-style] �
 The ingest pass is where colour is managed, by one shader function for every kind of frame:
 PQ and HLG EOTFs, tone mapping (BT.2390, Hable, Reinhard, clip) and BT.2020/P3 → BT.709 gamut
 mapping. For planar frames it follows range expansion and the BT.601/709/2020 matrix; for frames
-the browser decoded it follows the unpacking described below. Intermediates are RGBA16F. Canvas 2D
-is the compatibility floor (CPU YUV→RGB for planar frames, the browser's conversion for the rest).
+the browser decoded it follows the unpacking described below. The tone curve brings the peak of
+the source down to display white; where that peak comes from has a section of its own.
+Intermediates are RGBA16F. Canvas 2D is the compatibility floor (CPU YUV→RGB for planar frames,
+the browser's conversion for the rest).
 
 ### HDR frames the browser decoded
 
@@ -242,6 +245,66 @@ multiple of the canvas version in the mid-tones, where every tone curve is a str
 check holds with and without HDR10 static metadata, which only moves the highlights). If the
 import already equals the canvas, or fits nothing known, the frame is left as the browser made
 it. The verdict is shown in the stats overlay ("HDR samples").
+
+### The peak of the source
+
+A tone curve has to know what it is bringing down to display white. A fixed guess is wrong both
+ways: a film mastered at 4000 nits clips where the guess ends, and a scene that never passes 400
+nits is squeezed as if it reached the guess. `set hdr-peak-source` picks one of three sources, and
+each falls back on the next when it has nothing to offer:
+
+| Source | The peak is | Has nothing to offer when |
+| --- | --- | --- |
+| `measured` (default) | what the GPU finds in each picture, followed over time | the renderer cannot render to float textures |
+| `metadata` | MaxCLL, or else the peak of the mastering display | the stream states neither |
+| `fixed` | `hdr-peak` nits (1000 unless set) | |
+
+What that does to grey patches of `hdr_pq_peaks.mkv` (BT.2390, 8-bit output; the clip is tagged
+MaxCLL 4000 and cuts from a scene that peaks at 400 nits to one that reaches 4000):
+
+| Peak used | 50 / 100 / 203 / 400 nits | 203 / 1000 / 2000 / 4000 nits |
+| --- | --- | --- |
+| fixed, 1000 nits | 142 / 191 / 230 / 250 | 230 / 255 / 255 / 255 |
+| metadata, 4000 nits | 141 / 179 / 210 / 233 | 210 / 250 / 254 / 255 |
+| measured, 418 then 4083 nits | 142 / 191 / 243 / 255 | 210 / 250 / 254 / 255 |
+
+**Static metadata.** The browser's decoders know these numbers and pass none of them on: a
+`VideoFrame` has an empty `metadata()`, a `<video>` element has nothing, and mediabunny does not
+expose them. So they are read from the bytes (`hdr-metadata.ts`), wherever the stream keeps them:
+
+- HEVC and AVC: SEI messages 137 (mastering display colour volume) and 144 (content light
+  level), in the decoder configuration record and in the first key frame;
+- AV1: metadata OBUs of type HDR_CLL and HDR_MDCV, in `av1C` and in the first key frame;
+- Matroska and WebM: the `Colour` element of the track header, the only place VP9 has for them.
+  It lies in the first 64 kB of nearly every file, which costs one range request;
+- on the FFmpeg route: ffprobe's side data of the stream (what the container says) and, when that
+  is incomplete, of the first decoded frame (what the bitstream says).
+
+The bitstream is asked first and the container fills in what it leaves open. The result travels
+on `ColorInfo.hdrMetadata`, so every kind of frame reaches the renderer with it. MaxCLL is
+preferred to the mastering peak because it describes the content, not the monitor; a "peak"
+below 100 nits is a muxer's placeholder and is not believed.
+
+**Measuring** follows libplacebo's peak detection, in two small fragment passes ahead of the
+ingest, and nothing is read back to the CPU (`peak.ts`):
+
+1. *measure*: a 64 × 64 grid. Each cell holds the maximum and the mean over its part of the
+   picture, in PQ units of the brightest channel, which is the quantity the tone curve works on.
+   Taps are bilinear and two pixels apart, so every pixel of a picture up to 4K counts and a
+   single hot pixel does not set the peak.
+2. *reduce*: the maximum and the mean of the grid are blended into the state of the previous
+   picture, a 1 × 1 float texture: a first-order low-pass in PQ space with a time constant of
+   0.8 s of media time (libplacebo's 20 frames at 24 fps). When the mean moves by more than
+   1 to 3 % of the PQ range the scene has changed, and the state goes there at once.
+3. The ingest shader reads the state with one texel fetch.
+
+The state belongs to a position in a stream. A seek, a step backwards or another stream starts it
+over from the picture itself, and drawing the same picture again (a resize, a changed setting, a
+screenshot) measures nothing and changes nothing, so a paused picture looks the same every time.
+Measuring takes about a quarter as many texture samples as the ingest pass, and SDR playback
+pays nothing for it: the grid (and, on WebGL2, the measuring programs) are made when the first
+HDR picture is measured. The state is read back only when statistics are asked for (the "HDR
+peak" row of the overlay), asynchronously.
 
 ### Gamut mapping
 
@@ -300,6 +363,7 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 | **mediabunny for demux/remux** | Maintained, streaming, covers MP4/MOV/MKV/WebM/TS/Ogg/MP3/FLAC/WAV, and can write fragmented MP4 for the MSE tier. | No AVI/FLV (→ FFmpeg), no subtitle tracks (→ own Matroska scanner). |
 | **JASSUB (libass WASM)** for ASS | Real libass = real compatibility with complex typesetting. | The first draw after the overlay is created or resized does not reach the screen unless another frame follows; the manager issues confirming repaints when paused. |
 | **External textures for SDR, own shaders for planar/HDR** | Zero-copy where the browser's conversion is correct; full control where it matters. | HDR frames that cannot be read back as planes are imported as the browser packs them and unpacked in the shader, which rests on unspecified behaviour: it is checked per stream against the browser's 2D-canvas conversion and abandoned when the check fails. |
+| **HDR peak measured in two fragment passes, not a compute shader with a histogram** | The same passes run on WebGL2, and the result never leaves the GPU. | No percentile: the brightest small area sets the peak, where libplacebo's high-quality mode can ignore the top 0.005 % of pixels. |
 | **Matroska scan reads the file sequentially** | No index for subtitle blocks. | For URL sources the file is fetched once in the background to scan it. |
 | **Skin CSS scoping via native CSS nesting** | No build step for skin authors. | Requires browsers with CSS nesting (all current engines). |
 
@@ -308,8 +372,12 @@ shapes, imports and remote URLs stripped). Three skins ship: **Modern Glass**, *
 - Software AV1 decode in the FFmpeg tier (see above).
 - MP4 `tx3g` / non-Matroska embedded text subtitles are not extracted (external files work).
 - Pixel aspect ratio other than 1:1 is not applied by the canvas renderers.
-- HDR is tone-mapped to SDR; there is no HDR canvas output path yet. The mastering peak is taken
-  to be 1000 nits: static HDR10 metadata is not read and the peak is not measured per scene.
+- HDR is tone-mapped to SDR; there is no HDR canvas output path yet.
+- Static HDR metadata that an MP4 file states only in its `mdcv` / `clli` boxes (and not in the
+  bitstream) is found on the FFmpeg route alone; elsewhere such a file is tone-mapped with the
+  measured peak or the fixed value. Dynamic metadata (HDR10+, Dolby Vision) is not used.
+- The measured peak is the brightest two-by-two pixel area, not a percentile: a highlight a few
+  pixels wide sets it. The Canvas 2D renderer has no tone curve of its own and so no peak.
 - WebGL2 receives only 8 bits of an HDR frame the browser decoded, so fine gradients can band
   there (deband helps); WebGPU gets the full depth. The Canvas 2D renderer shows such frames as
   the browser converts them, about a stop darker than the other two.

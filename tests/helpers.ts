@@ -34,6 +34,16 @@ export const manifest: {
   flash: { x: number; y: number; w: number; h: number; period: number; on: number };
   colorPatches: Record<'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight', [number, number, number]>;
   hdrSteps: Record<'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight', number>;
+  /** hdr_pq_peaks.mkv: grey patches in nits before and after the cut, and its static HDR10 metadata. */
+  hdrPeaks: {
+    cut: number;
+    dim: Record<'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight', number>;
+    bright: Record<'topLeft' | 'topRight' | 'bottomLeft' | 'bottomRight', number>;
+    maxCll: number;
+    maxFall: number;
+    masteringMax: number;
+    masteringMin: number;
+  };
   sync: {
     boxes: Array<{ name: string; start: number; end: number; x: number; y: number; w: number; h: number; rgb: [number, number, number] }>;
   };

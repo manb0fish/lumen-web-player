@@ -17,6 +17,7 @@ import {
   EncodedPacketSink,
   EncodedVideoPacketSource,
   Input,
+  MatroskaInputFormat,
   Mp4OutputFormat,
   Output,
   StreamTarget,
@@ -25,7 +26,19 @@ import {
   type InputAudioTrack,
   type InputVideoTrack,
 } from 'mediabunny';
-import type { AudioTrackInfo, ColorInfo, MediaInfo, VideoTrackInfo } from '../core/types';
+import type { AudioTrackInfo, ColorInfo, HdrMetadata, MediaInfo, VideoTrackInfo } from '../core/types';
+import {
+  av1cHdrMetadata,
+  av1HdrMetadata,
+  hdrMetadataComplete,
+  hvccHdrMetadata,
+  MATROSKA_HEAD,
+  matroskaHdrMetadata,
+  matroskaTracks,
+  mergeHdrMetadata,
+  nalLengthSize,
+  seiHdrMetadata,
+} from './hdr-metadata';
 
 const post = (msg: any, transfer: Transferable[] = []) => (self as any).postMessage(msg, transfer);
 
@@ -139,6 +152,78 @@ function bitDepthFromCodecString(s: string | null): number {
   return 8;
 }
 
+/** Bytes [start, end) of the source, or as many of them as exist. Null when they cannot be had. */
+async function readRange(source: Blob | string, start: number, end: number): Promise<Uint8Array | null> {
+  try {
+    if (typeof source !== 'string') return start < source.size ? new Uint8Array(await source.slice(start, end).arrayBuffer()) : null;
+    const abort = new AbortController();
+    const res = await fetch(source, { headers: { Range: `bytes=${start}-${end - 1}` }, signal: abort.signal });
+    try {
+      // A server without range support sends the whole file: good for its head, and only for that.
+      if (!res.ok || !res.body || (res.status !== 206 && start > 0)) return null;
+      const out = new Uint8Array(end - start);
+      const reader = res.body.getReader();
+      let n = 0;
+      while (n < out.length) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const take = Math.min(value.length, out.length - n);
+        out.set(value.subarray(0, take), n);
+        n += take;
+      }
+      return out.subarray(0, n);
+    } finally {
+      abort.abort(); // whatever is left of the body is not wanted
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Static HDR10 metadata of the video track (hdr-metadata.ts says where streams keep it). The
+ * bitstream is asked first: it costs nothing that playback would not read anyway. The container
+ * fills in what the bitstream does not say, and is all there is for VP9.
+ */
+async function readHdrMetadata(source: Blob | string, track: InputVideoTrack, matroska: boolean): Promise<HdrMetadata | null> {
+  let found: HdrMetadata | null = null;
+  const codec = track.codec;
+  if (codec === 'hevc' || codec === 'avc' || codec === 'av1') {
+    try {
+      const d = (await track.getDecoderConfig())?.description;
+      const record = d ? (ArrayBuffer.isView(d) ? new Uint8Array(d.buffer, d.byteOffset, d.byteLength) : new Uint8Array(d)) : null;
+      if (record) found = codec === 'hevc' ? hvccHdrMetadata(record) : codec === 'av1' ? av1cHdrMetadata(record) : null;
+      if (!hdrMetadataComplete(found)) {
+        const sink = new EncodedPacketSink(track);
+        let packet = await sink.getFirstPacket();
+        if (packet && packet.type !== 'key') packet = (await sink.getNextKeyPacket(packet)) ?? packet;
+        if (packet) {
+          const inBand = codec === 'av1' ? av1HdrMetadata(packet.data) : seiHdrMetadata(packet.data, codec, nalLengthSize(record, codec));
+          found = mergeHdrMetadata(found, inBand);
+        }
+      }
+    } catch {
+      /* the picture does not depend on it */
+    }
+  }
+  if (matroska && !hdrMetadataComplete(found)) {
+    let range = { start: 0, end: MATROSKA_HEAD };
+    // The head; then, rarely, wherever Tracks turns out to be; then the rest of a long Tracks.
+    for (let round = 0; round < 3; round++) {
+      const buf = await readRange(source, range.start, range.end);
+      if (!buf?.length) break;
+      const r = matroskaTracks(buf, range.start);
+      if (!r) break;
+      if ('tracks' in r) {
+        found = mergeHdrMetadata(found, matroskaHdrMetadata(r.tracks, track.id));
+        break;
+      }
+      range = r.read;
+    }
+  }
+  return found;
+}
+
 /**
  * Mediabunny retries a failed request for ever by default. Ride out a short network blip
  * (about twelve seconds in all), then let the load fail with an error the player can show.
@@ -196,6 +281,10 @@ async function open(source: Blob | string): Promise<any> {
       /* keep default */
     }
     const color = mapColor(cs);
+    if (color.transfer === 'pq' || color.transfer === 'hlg') {
+      const meta = await readHdrMetadata(source, vTrack, format instanceof MatroskaInputFormat);
+      if (meta) color.hdrMetadata = meta;
+    }
     video = {
       id: vTrack.id,
       codec: vTrack.codec ?? 'unknown',

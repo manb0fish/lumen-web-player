@@ -225,7 +225,9 @@ test('long playback with periodic seeks keeps frame and heap usage flat', async 
   });
   expect(r.opened).toBeGreaterThan(500);
   expect(r.maxAlive, 'VideoFrames open at once').toBeLessThanOrEqual(48);
-  expect(r.textures, 'live GPU textures stays constant').toBeLessThanOrEqual(4);
+  // Two pass targets and the two 1x1 textures of the HDR peak state, which exist for as long as
+  // the renderer does; the measuring grid is not made for SDR. Nothing may pile up beyond that.
+  expect(r.textures, 'live GPU textures stays constant').toBeLessThanOrEqual(6);
   expect(r.heapGrowth, 'JS heap growth over 12 s at 2x, MB').toBeLessThan(10);
   expectNoErrors(errors);
 });

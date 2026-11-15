@@ -3,6 +3,7 @@
  * Texture space here follows GL conventions (v = 0 is the bottom row of an FBO); only the ingest
  * passes flip, because uploaded images have their first row at v = 0.
  */
+import { PEAK_GRID } from './peak';
 
 export const GLSL_VERT = /* glsl */ `#version 300 es
 out vec2 vUv;
@@ -111,12 +112,16 @@ vec3 gamutCompress(vec3 c, vec3 src) {
   return o;
 }
 
-// transfer: 0 sdr, 1 pq, 2 hlg.  primaries: 0 709, 1 2020, 2 p3.  tone: curve.  gamut: 0 clip, 1 soft.
+// transfer: 0 sdr, 1 pq, 2 hlg.
+vec3 sourceLight(vec3 coded, int transfer) {
+  if (transfer == 1) return pqEotf(clamp(coded, 0.0, 1.0)) * (10000.0 / SDR_WHITE);
+  if (transfer == 2) return hlgToDisplay(clamp(coded, 0.0, 1.0)) * (1000.0 / SDR_WHITE);
+  return pow(max(coded, vec3(0.0)), vec3(2.4));
+}
+
+// primaries: 0 709, 1 2020, 2 p3.  tone: curve.  gamut: 0 clip, 1 soft.
 vec3 colorManage(vec3 coded, int transfer, int primaries, int tone, int gamut, float peakNits) {
-  vec3 lin;
-  if (transfer == 1) lin = pqEotf(clamp(coded, 0.0, 1.0)) * (10000.0 / SDR_WHITE);
-  else if (transfer == 2) lin = hlgToDisplay(clamp(coded, 0.0, 1.0)) * (1000.0 / SDR_WHITE);
-  else lin = pow(max(coded, vec3(0.0)), vec3(2.4));
+  vec3 lin = sourceLight(coded, transfer);
   if (transfer != 0) {
     float peak = max(peakNits / SDR_WHITE, 1.0);
     float m = max(max(lin.r, lin.g), max(lin.b, 1e-6));
@@ -137,35 +142,78 @@ vec3 colorManage(vec3 coded, int transfer, int primaries, int tone, int gamut, f
 }
 `;
 
-export const GLSL_INGEST_EXTERNAL = /* glsl */ `${HEAD}
-${COLOR}
+/** The measured peak, as the reduce pass left it (see peakState in wgsl.ts). */
+const PEAK_STATE = /* glsl */ `
+uniform sampler2D uPeakState;
+float measuredPeak() {
+  return pqEotf1(texelFetch(uPeakState, ivec2(0), 0).r) * 10000.0;
+}
+`;
+
+/** One cell of the measuring grid per fragment (see MEASURE in wgsl.ts). */
+const MEASURE = /* glsl */ `
+uniform ivec2 uTaps;   // taps per cell and axis
+void main() {
+  vec2 cell = floor(gl_FragCoord.xy);
+  float hi = 0.0;
+  float sum = 0.0;
+  for (int j = 0; j < uTaps.y; j++) {
+    for (int i = 0; i < uTaps.x; i++) {
+      vec2 uv = (cell + (vec2(float(i), float(j)) + 0.5) / vec2(uTaps)) / ${PEAK_GRID}.0;
+      vec3 lin = sourceLight(codedAt(uv), srcTransfer());
+      float v = pqOetf1(max(lin.r, max(lin.g, lin.b)) * (SDR_WHITE / 10000.0));
+      hi = max(hi, v);
+      sum += v;
+    }
+  }
+  outColor = vec4(hi, sum / float(uTaps.x * uTaps.y), 0.0, 1.0);
+}`;
+
+const EXTERNAL_SOURCE = /* glsl */ `
 uniform sampler2D uTex;
 uniform ivec4 uMode;   // packing (0 converted by the browser, 1 coded, 2 coded behind matrix + sRGB OETF), transfer, primaries, rotation
-uniform ivec2 uOpt;    // tone map, gamut mapping
-uniform float uPeak;
+
+int srcTransfer() { return uMode.y; }
+
+// The sample at uv as the stream coded it (uv: v = 0 is the first row of the picture).
+vec3 codedAt(vec2 uv) {
+  vec3 c = textureLod(uTex, uv, 0.0).rgb;
+  if (uMode.x != 2) return c;
+  vec3 v = srgbEotfSigned(c);
+  if (uMode.z == 1) {
+    return vec3(dot(vec3(0.627404, 0.329283, 0.043313), v),
+                dot(vec3(0.069097, 0.919540, 0.011362), v),
+                dot(vec3(0.016391, 0.088013, 0.895595), v));
+  }
+  if (uMode.z == 2) {
+    return vec3(dot(vec3(0.822462, 0.177538, 0.0), v),
+                dot(vec3(0.033194, 0.966806, 0.0), v),
+                dot(vec3(0.017083, 0.072397, 0.910520), v));
+  }
+  return v;
+}
+`;
+
+export const GLSL_INGEST_EXTERNAL = /* glsl */ `${HEAD}
+${COLOR}
+${EXTERNAL_SOURCE}
+${PEAK_STATE}
+uniform ivec3 uOpt;    // tone map, gamut mapping, 1: the peak is the measured one
+uniform float uPeak;   // source peak in nits (when not measured)
 void main() {
   vec2 uv = rotUv(vec2(vUv.x, 1.0 - vUv.y), uMode.w);
-  vec3 c = texture(uTex, uv).rgb;
-  if (uMode.x != 0) {
-    vec3 coded = c;
-    if (uMode.x == 2) {
-      vec3 v = srgbEotfSigned(c);
-      if (uMode.z == 1) {
-        coded = vec3(dot(vec3(0.627404, 0.329283, 0.043313), v),
-                     dot(vec3(0.069097, 0.919540, 0.011362), v),
-                     dot(vec3(0.016391, 0.088013, 0.895595), v));
-      } else if (uMode.z == 2) {
-        coded = vec3(dot(vec3(0.822462, 0.177538, 0.0), v),
-                     dot(vec3(0.033194, 0.966806, 0.0), v),
-                     dot(vec3(0.017083, 0.072397, 0.910520), v));
-      } else {
-        coded = v;
-      }
-    }
-    c = colorManage(coded, uMode.y, uMode.z, uOpt.x, uOpt.y, uPeak);
+  if (uMode.x == 0) {
+    outColor = vec4(textureLod(uTex, uv, 0.0).rgb, 1.0);
+    return;
   }
-  outColor = vec4(c, 1.0);
+  float peak = uOpt.z == 1 ? measuredPeak() : uPeak;
+  outColor = vec4(colorManage(codedAt(uv), uMode.y, uMode.z, uOpt.x, uOpt.y, peak), 1.0);
 }`;
+
+export const GLSL_MEASURE_EXTERNAL = /* glsl */ `${HEAD}
+${COLOR}
+${EXTERNAL_SOURCE}
+${MEASURE}`;
 
 /** Reads tiles of the uploaded external texture 1:1 for the hand-over check (see WGSL_PROBE_EXTERNAL). */
 export const GLSL_PROBE_EXTERNAL = /* glsl */ `${HEAD}
@@ -180,8 +228,7 @@ void main() {
   outColor = vec4(texelFetch(uTex, src, 0).rgb, 1.0);
 }`;
 
-export const GLSL_INGEST_PLANAR = /* glsl */ `${HEAD}
-${COLOR}
+const PLANAR_SOURCE = /* glsl */ `
 uniform sampler2D uTexY;
 uniform sampler2D uTexU;
 uniform sampler2D uTexV;
@@ -191,19 +238,64 @@ uniform vec3 uM2;
 uniform vec3 uOff;
 uniform vec3 uScl;
 uniform vec2 uPack;
-uniform float uPeak;
 uniform ivec4 uMode;   // transfer, primaries, tone map, rotation
-uniform int uGamut;    // 0 clip, 1 soft
+
+int srcTransfer() { return uMode.x; }
+
+// The sample at uv as R'G'B' (uv: v = 0 is the first row of the picture).
+vec3 codedAt(vec2 uv) {
+  float y = dot(textureLod(uTexY, uv, 0.0).rg, uPack);
+  float cb = dot(textureLod(uTexU, uv, 0.0).rg, uPack);
+  float cr = dot(textureLod(uTexV, uv, 0.0).rg, uPack);
+  vec3 yuv = (vec3(y, cb, cr) - uOff) * uScl;
+  return vec3(dot(uM0, yuv), dot(uM1, yuv), dot(uM2, yuv));
+}
+`;
+
+export const GLSL_INGEST_PLANAR = /* glsl */ `${HEAD}
+${COLOR}
+${PLANAR_SOURCE}
+${PEAK_STATE}
+uniform float uPeak;   // source peak in nits (when not measured)
+uniform ivec2 uOpt;    // gamut mapping (0 clip, 1 soft), 1: the peak is the measured one
 
 void main() {
-  vec2 uv = rotUv(vec2(vUv.x, 1.0 - vUv.y), uMode.w);
-  float y = dot(texture(uTexY, uv).rg, uPack);
-  float cb = dot(texture(uTexU, uv).rg, uPack);
-  float cr = dot(texture(uTexV, uv).rg, uPack);
-  vec3 yuv = (vec3(y, cb, cr) - uOff) * uScl;
-  vec3 rgb = vec3(dot(uM0, yuv), dot(uM1, yuv), dot(uM2, yuv));
-  if (uMode.x != 0 || uMode.y != 0) rgb = colorManage(rgb, uMode.x, uMode.y, uMode.z, uGamut, uPeak);
+  vec3 rgb = codedAt(rotUv(vec2(vUv.x, 1.0 - vUv.y), uMode.w));
+  if (uMode.x != 0 || uMode.y != 0) {
+    float peak = uOpt.y == 1 ? measuredPeak() : uPeak;
+    rgb = colorManage(rgb, uMode.x, uMode.y, uMode.z, uOpt.x, peak);
+  }
   outColor = vec4(rgb, 1.0);
+}`;
+
+export const GLSL_MEASURE_PLANAR = /* glsl */ `${HEAD}
+${COLOR}
+${PLANAR_SOURCE}
+${MEASURE}`;
+
+/** Reduces the measuring grid and blends it into the previous state (see WGSL_PEAK_REDUCE). */
+export const GLSL_PEAK_REDUCE = /* glsl */ `${HEAD}
+uniform sampler2D uGrid;
+uniform sampler2D uPrev;
+uniform vec4 uP;   // 1: start over from this picture, weight of this picture in the low-pass, scene-change thresholds
+void main() {
+  float hi = 0.0;
+  float sum = 0.0;
+  for (int y = 0; y < ${PEAK_GRID}; y++) {
+    for (int x = 0; x < ${PEAK_GRID}; x++) {
+      vec2 c = texelFetch(uGrid, ivec2(x, y), 0).rg;
+      hi = max(hi, c.r);
+      sum += c.g;
+    }
+  }
+  vec2 cur = vec2(hi, sum / ${PEAK_GRID * PEAK_GRID}.0);
+  if (uP.x > 0.5) {
+    outColor = vec4(cur, 0.0, 1.0);
+    return;
+  }
+  vec2 old = texelFetch(uPrev, ivec2(0), 0).rg;
+  float k = max(uP.y, smoothstep(uP.z, uP.w, abs(cur.g - old.g)));
+  outColor = vec4(mix(old, cur, k), 0.0, 1.0);
 }`;
 
 export const GLSL_DEBAND = /* glsl */ `${HEAD}
